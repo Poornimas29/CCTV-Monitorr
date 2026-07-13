@@ -1,0 +1,99 @@
+import cv2
+import os
+import sys
+import urllib.parse
+from dotenv import load_dotenv
+
+# Load connection settings from .env file
+load_dotenv()
+
+# 1. Configure backend transport (try TCP for more reliable connections)
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+
+# Load base configuration from .env dynamically (no hardcoded details)
+host = os.getenv("RTSP_HOST", "")
+username = os.getenv("RTSP_USERNAME", "")
+password = os.getenv("RTSP_PASSWORD", "")
+port = os.getenv("RTSP_PORT", "")
+
+if not host or not username:
+    print("[FAIL] Missing RTSP_HOST or RTSP_USERNAME in .env file.")
+    sys.exit(1)
+
+# URL encode password to handle special characters (e.g. '@')
+encoded_pwd = urllib.parse.quote(password)
+rtsp_url = f"rtsp://{username}:{encoded_pwd}@{host}:{port}/cam/realmonitor?channel=3&subtype=0"
+
+# ─────────────────────────────────────────────
+# 2. CONNECTION CHECK — run this before the live window
+# ─────────────────────────────────────────────
+print("=" * 55)
+print("  RTSP CONNECTION TEST")
+print("=" * 55)
+print(f"  HOST : {host}:{port}")
+print(f"  USER : {username}")
+print(f"  TRANS: TCP (stable for local cameras)")
+print("-" * 55)
+
+print("Attempting to open stream...")
+cap = cv2.VideoCapture(rtsp_url, cv2.CAP_FFMPEG)
+
+if not cap.isOpened():
+    print("[FAIL] Could not open the RTSP stream.")
+    print("   Possible causes:")
+    print("   - Wrong credentials (RTSP_USERNAME / RTSP_PASSWORD in .env)")
+    print("   - Wrong channel number (try channel=1)")
+    print(f"  - Camera not reachable at {host}:{port}")
+    print("   - SmartPSS Lite RTSP proxy not exposing this stream")
+    print("=" * 55)
+    exit(1)
+
+# Try reading the first frame to confirm real data is coming
+print("Stream opened. Reading first frame...")
+ret, frame = cap.read()
+
+if not ret or frame is None:
+    print("[FAIL] Stream opened but could not read first frame.")
+    print("   This often means authentication failed or the channel is invalid.")
+    cap.release()
+    exit(1)
+
+# ✅ Connection successful — print stream info
+width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+fps    = cap.get(cv2.CAP_PROP_FPS)
+
+print("[OK] SUCCESS: Stream is LIVE!")
+print(f"   Resolution : {width} x {height}")
+print(f"   FPS        : {fps:.1f}")
+print("=" * 55)
+print("Launching viewer window... Press 'Q' to quit.")
+print("=" * 55)
+
+# ─────────────────────────────────────────────
+# 3. LIVE VIEWER WINDOW
+# ─────────────────────────────────────────────
+# WINDOW_NORMAL allows the window to be resized and scaled by Windows
+cv2.namedWindow("High-Quality Scaled Feed", cv2.WINDOW_NORMAL)
+
+# Lock correct aspect ratio so the image does not warp
+cv2.setWindowProperty("High-Quality Scaled Feed", cv2.WND_PROP_ASPECT_RATIO, cv2.WINDOW_KEEPRATIO)
+
+# Show the first frame already captured
+cv2.imshow("High-Quality Scaled Feed", frame)
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        print("[WARN] Frame read failed - stream may have dropped.")
+        continue
+
+    # Display the RAW frame. Drag window corners to resize on desktop.
+    cv2.imshow("High-Quality Scaled Feed", frame)
+
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
+print("Viewer closed.")
