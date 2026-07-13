@@ -43,7 +43,7 @@ class CameraManager:
 
     def __init__(
         self,
-        camera_cfg: Dict[str, str] | None = None,
+        camera_cfg: Optional[Dict[str, str]] = None,
         reconnect_interval: int = 5,
         buffer_size: int = 10,
     ):
@@ -114,6 +114,7 @@ class CameraManager:
 
         from config import settings
         rtsp_password = getattr(settings, "RTSP_PASSWORD", "")
+        self._stop_event.clear()
 
         for cam_id, cam in self.camera_configs.items():
             url = cam.get("url") or self.generate_rtsp_url(cam.get("channel", 1))
@@ -126,6 +127,11 @@ class CameraManager:
             self.streams[cam_id] = stream_mgr
             self._buffers[cam_id] = None
 
+            # Spawn a producer thread that fetches frames from the StreamManager and pushes to the shared queue
+            t = threading.Thread(target=self._producer_compat, args=(cam_id, stream_mgr), daemon=True, name=f"{cam_id}-compat-prod")
+            t.start()
+            self._threads.append(t)
+
     def start(self) -> None:
         """Start all RTSP streams (alias for start_all)."""
         self.start_all()
@@ -136,6 +142,21 @@ class CameraManager:
         for s in list(self.streams.values()):
             s.stop()
         self.streams.clear()
+        self._threads.clear()
+
+    def _producer_compat(self, cam_id: str, stream_mgr: object) -> None:
+        last_ts = None
+        while not self._stop_event.is_set():
+            latest = stream_mgr.frame_buffer.latest()
+            if latest is not None:
+                frame, ts = latest
+                if ts != last_ts:
+                    try:
+                        self._queue.put((cam_id, frame, ts), block=False)
+                        last_ts = ts
+                    except Exception:
+                        pass
+            time.sleep(0.01)
 
     # ---------------------------------------------------------------------
     # Internal producer per camera (legacy compatibility)

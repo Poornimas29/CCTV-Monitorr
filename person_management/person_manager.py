@@ -8,7 +8,7 @@ mobile phone usage monitoring, and employee productivity scoring.
 from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 @dataclass
 class PersonState:
@@ -24,6 +24,12 @@ class PersonState:
     recognition_status: Literal["unknown", "pending", "identified"] = "unknown"
     employee_id: str | None = None
     employee_name: str = "Unknown"
+    recognition_confidence: float = 0.0
+    session_start_time: Optional[datetime] = None
+    
+    # Persistent recognition retry and appearance ReID
+    last_recognition_attempt: Optional[datetime] = None
+    reid_hist: Optional[Any] = None
     
     # Enriched state fields for employee productivity monitoring
     phone_use_detected: bool = False
@@ -81,11 +87,14 @@ class PersonManager:
                     recognition_status="unknown"
                 )
 
-        # 2. Handle missing IDs
+        # 2. Handle missing IDs and clean up stale exited tracks
         for pid, person in list(self._persons.items()):
             if pid not in current_ids:
                 if timestamp - person.last_seen > self.LOST_TIMEOUT:
                     person.status = "exited"
+                    # Clean up track from registry after 5 minutes of exit to prevent memory leaks
+                    if timestamp - person.last_seen > timedelta(minutes=5):
+                        del self._persons[pid]
                 else:
                     person.status = "lost"
 

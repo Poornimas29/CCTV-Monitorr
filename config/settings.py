@@ -35,13 +35,18 @@ CAMERAS: list[dict] = [
     {
         "id": "CAM002",
         "name": "Working Bay Camera",
-        "channel": 5,
+        "channel": 6,
         "enabled": True
     },
     {
         "id": "CAM003",
         "name": "Packing Area",
         "channel": 4,
+        "enabled": True
+    },{
+        "id": "CAM004",
+        "name": "Hall Area",
+        "channel": 10,
         "enabled": True
     }
 ]

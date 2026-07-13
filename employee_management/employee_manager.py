@@ -57,18 +57,36 @@ class EmployeeManager:
 
     def load_employees(self) -> None:
         """
-        Loads all employees from the configuration registry.
-
-        Validates:
-          1. No duplicate employee IDs.
-          2. Each employee's image folder exists on disk.
-
-        Raises:
-            ValueError: If duplicate employee IDs are detected.
+        Loads all employees by combining the static config registry with a dynamic scan of new folders on disk.
         """
-        logger.info("Loading employee registry...")
+        logger.info("Loading employee registry (merging static config and dynamic folders)...")
 
-        raw: List[dict] = EMPLOYEES
+        # Read from local module-level global EMPLOYEES to support test patching
+        raw = list(EMPLOYEES)
+        existing_ids = {record.get("employee_id") for record in raw if record.get("employee_id")}
+
+        # Scan for any additional folders on disk that are not in the static config
+        images_dir = (self._root / "employee_images").resolve()
+        if images_dir.exists():
+            for item in images_dir.iterdir():
+                if item.is_dir():
+                    emp_id = item.name
+                    if emp_id not in existing_ids:
+                        # Determine name dynamically
+                        name = emp_id
+                        name_file = item / "name.txt"
+                        if name_file.exists():
+                            try:
+                                name = name_file.read_text(encoding="utf-8").strip()
+                            except Exception:
+                                pass
+                        
+                        raw.append({
+                            "employee_id": emp_id,
+                            "name": name,
+                            "status": "Active",
+                            "image_folder": f"employee_images/{emp_id}"
+                        })
 
         # ── 1. Validate unique IDs ────────────────────────────────────
         self._validate_unique_ids(raw)
@@ -76,11 +94,11 @@ class EmployeeManager:
         # ── 2. Load into internal dict and validate image folders ─────
         self._employees = {}
         for record in raw:
-            emp_id: str = record["employee_id"]
+            emp_id = record["employee_id"]
 
             # Resolve image folder to absolute path
-            folder_path: Path = (self._root / record["image_folder"]).resolve()
-            record = dict(record)  # shallow copy to avoid mutating config
+            folder_path = (self._root / record["image_folder"]).resolve()
+            record = dict(record)
             record["image_folder_abs"] = str(folder_path)
 
             self._employees[emp_id] = record

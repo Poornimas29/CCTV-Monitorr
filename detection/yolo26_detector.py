@@ -78,7 +78,17 @@ class YOLO26Detector:
                 self.simulation = False
                 logger.info("YOLO26Detector initialized with PyTorch model at: %s", self.model_path)
             else:
-                logger.warning("YOLO model path not specified or does not exist. Falling back to simulation mode.")
+                logger.info("No custom YOLO model path specified. Loading base yolov5s from torch hub...")
+                self.model = torch.hub.load(
+                    "ultralytics/yolov5",
+                    "yolov5s",
+                    pretrained=True,
+                    force_reload=False,
+                ).to(self.device)
+                self.model.conf = 0.4
+                self.model.classes = [0, 67]  # Limit detections to person (0) and cell phone (67)
+                self.simulation = False
+                logger.info("YOLOv5s model loaded successfully from torch hub.")
         except Exception as exc:
             logger.warning("Could not load PyTorch YOLO detector: %s. Running in simulation mode.", exc)
 

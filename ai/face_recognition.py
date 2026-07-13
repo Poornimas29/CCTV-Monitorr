@@ -8,6 +8,7 @@ streaming and dashboard modules continue to work unchanged.
 
 from __future__ import annotations
 
+import os
 import json
 import logging
 from pathlib import Path
@@ -27,7 +28,7 @@ class FaceRecognitionEngine:
         project_root: Optional[str] = None,
         cache_path: Optional[str] = None,
         detector_path: Optional[str] = None,
-        threshold: float = 0.75,
+        threshold: float = 0.40,
         debug: bool = False,
     ) -> None:
         self._project_root = Path(project_root or Path(__file__).resolve().parent.parent).resolve()
@@ -39,6 +40,14 @@ class FaceRecognitionEngine:
         self._detector = None
         self._insightface_app = None
         self._backend_name = "custom"
+
+        # Load threshold from environment or parameter
+        env_threshold = os.getenv("FACE_RECOGNITION_THRESHOLD")
+        if env_threshold is not None:
+            try:
+                threshold = float(env_threshold)
+            except ValueError:
+                pass
         self._threshold = threshold
         self._debug = debug
 
@@ -77,17 +86,44 @@ class FaceRecognitionEngine:
             image_paths = employee_manager.get_employee_images(emp_id)
             cache_entry = cache_payload.get(emp_id)
 
+            # Build current images metadata
+            current_metadata = []
+            for path_str in image_paths:
+                p = Path(path_str)
+                if p.exists():
+                    stat = p.stat()
+                    current_metadata.append({
+                        "path": p.name,
+                        "mtime": stat.st_mtime,
+                        "size": stat.st_size
+                    })
+
             expected_dim = 512 if self._backend_name == "insightface" else 4096
-            if cache_entry and int(cache_entry.get("image_count", 0)) == len(image_paths):
-                embedding = np.asarray(cache_entry.get("embedding", []), dtype=np.float32)
-                if embedding.size == expected_dim:
-                    self._employee_embeddings[emp_id] = {
-                        "employee_id": emp_id,
-                        "name": employee.get("name", emp_id),
-                        "embedding": embedding,
-                        "image_count": len(image_paths),
-                    }
-                    continue
+            cached_metadata = cache_entry.get("images_metadata") if cache_entry else None
+            is_cache_valid = False
+
+            if cache_entry and cached_metadata and len(cached_metadata) == len(current_metadata):
+                matches = True
+                for c_meta, r_meta in zip(current_metadata, cached_metadata):
+                    if (c_meta["path"] != r_meta.get("path") or 
+                        abs(c_meta["mtime"] - r_meta.get("mtime", 0.0)) > 0.1 or 
+                        c_meta["size"] != r_meta.get("size")):
+                        matches = False
+                        break
+                if matches:
+                    embedding = np.asarray(cache_entry.get("embedding", []), dtype=np.float32)
+                    if embedding.size == expected_dim:
+                        is_cache_valid = True
+                        self._employee_embeddings[emp_id] = {
+                            "employee_id": emp_id,
+                            "name": employee.get("name", emp_id),
+                            "embedding": embedding,
+                            "image_count": len(image_paths),
+                            "images_metadata": current_metadata,
+                        }
+
+            if is_cache_valid:
+                continue
 
             embedding = self._build_employee_embedding(image_paths)
             if embedding is None:
@@ -98,6 +134,7 @@ class FaceRecognitionEngine:
                 "name": employee.get("name", emp_id),
                 "embedding": embedding,
                 "image_count": len(image_paths),
+                "images_metadata": current_metadata,
             }
 
         self._save_cache()
@@ -166,6 +203,7 @@ class FaceRecognitionEngine:
 
         return {
             "employee_id": best_employee_id if matched else None,
+            "best_employee_id": best_employee_id,
             "employee_name": best_name if matched else "Unknown",
             "confidence": round(float(best_similarity * 100.0), 1) if matched else 0.0,
             "matched": matched,
@@ -209,6 +247,7 @@ class FaceRecognitionEngine:
         matched = best_employee_id is not None and best_similarity >= self._threshold
         return {
             "employee_id": best_employee_id if matched else None,
+            "best_employee_id": best_employee_id,
             "employee_name": best_name if matched else "Unknown",
             "confidence": round(float(best_similarity * 100.0), 1) if matched else 0.0,
             "matched": matched,
@@ -273,7 +312,13 @@ class FaceRecognitionEngine:
                     2,
                     cv2.LINE_AA,
                 )
-                logger.info("[%s] Unknown face detected", camera_name)
+                logger.info(
+                    "[%s] Unknown face detected. Best match similarity: %.4f for %s (threshold: %.2f)",
+                    camera_name,
+                    result.get("similarity", 0.0),
+                    result.get("best_employee_id", "None"),
+                    self._threshold,
+                )
 
         return annotated, result
 
@@ -402,6 +447,7 @@ class FaceRecognitionEngine:
                 "name": record.get("name", emp_id),
                 "embedding": record.get("embedding", []).tolist(),
                 "image_count": record.get("image_count", 0),
+                "images_metadata": record.get("images_metadata", []),
             }
         try:
             self._cache_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
