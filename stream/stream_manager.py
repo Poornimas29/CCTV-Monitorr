@@ -47,6 +47,14 @@ class StreamManager:
         self._connected = False
         self._last_fps: float = 0.0
         self._last_resolution: Tuple[int, int] = (0, 0)
+        
+        class DummyReader:
+            def __init__(self, parent):
+                self.parent = parent
+            @property
+            def is_running(self) -> bool:
+                return self.parent._thread is not None and self.parent._thread.is_alive()
+        self.reader = DummyReader(self)
 
     # ---------------------------------------------------------------------
     # Lifecycle control

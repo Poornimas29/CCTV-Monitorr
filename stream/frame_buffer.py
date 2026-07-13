@@ -35,6 +35,23 @@ class FrameBuffer:
                 return None
             return self.buffer[-1]
 
+    def put(self, frame: np.ndarray) -> None:
+        """Add a copy of the frame to the buffer (compatibility with legacy code)."""
+        self.add(frame.copy(), datetime.utcnow())
+
+    def get(self) -> np.ndarray | None:
+        """Return the most recent frame, or None if empty (compatibility with legacy code)."""
+        latest = self.latest()
+        if latest is None:
+            return None
+        frame, _ = latest
+        return frame
+
+    def clear(self) -> None:
+        """Clear all frames from the buffer (compatibility with legacy code)."""
+        with self.lock:
+            self.buffer.clear()
+
     def __len__(self) -> int:
         with self.lock:
             return len(self.buffer)

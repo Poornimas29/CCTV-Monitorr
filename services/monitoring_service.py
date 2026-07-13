@@ -1,28 +1,29 @@
 # services/monitoring_service.py
-"""MonitoringService orchestrates the end‑to‑end pipeline.
+"""MonitoringService orchestrates the end-to-end person and phone monitoring pipeline.
 
 It ties together:
-* :class:`stream.camera_manager.CameraManager` – reads frames from one or more RTSP sources.
-* :class:`detection.yolo26_detector.YOLO26Detector` – runs a lightweight person detector.
-* :class:`tracking.tracker.Tracker` – maintains persistent tracks via ByteTrack.
-* :class:`person_management.person_manager.PersonManager` – produces per‑person state changes.
-* :class:`visualisation.renderer.Renderer` – draws an annotated overlay on the frame.
-
-The service writes a JSON payload for every processed frame into ``settings.OUTPUT_DIR``.
-No external API is exposed at this stage – the service is started via a simple
-script (``run_monitoring.py``)."""
+* CameraManager - reads frames from RTSP streams.
+* YOLO26Detector - detects persons and mobile phones.
+* Tracker - tracks persons persistently.
+* PersonManager - manages track lifecycles, checks phone overlaps, and calculates productivity.
+* FaceRecognitionEngine - recognizes faces on cropped person regions.
+* Renderer - annotates frames.
+"""
 
 import os
 import json
 import cv2
 import argparse
 import sys
-# Ensure the project root (which contains the 'config' package) is on sys.path
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 from datetime import datetime
 from typing import Optional
 
-from config.settings import settings
+# Ensure project root is in sys.path
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.append(PROJECT_ROOT)
+
+import config.settings as settings
 from stream.camera_manager import CameraManager
 from detection.yolo26_detector import YOLO26Detector
 from tracking.tracker import Tracker
@@ -31,26 +32,54 @@ from visualisation.renderer import Renderer
 
 
 class MonitoringService:
+    """Orchestrates the CCTV monitoring pipeline."""
     def __init__(self, max_frames: Optional[int] = None, display: bool = False):
         self.max_frames = max_frames
         self.display = display
         self.frame_counter = 0
 
-        # Initialise components.
+        # Initialise core pipeline modules
         self.camera_manager = CameraManager()
         self.detector = YOLO26Detector.instance()
         self.tracker = Tracker()
         self.person_manager = PersonManager()
         self.renderer = Renderer()
 
+        # Initialize Employee and Face Recognition components
+        from employee_management.employee_manager import EmployeeManager
+        self.employee_manager = EmployeeManager(project_root=PROJECT_ROOT)
+        self.employee_manager.load_employees()
+
+        from ai.face_recognition import FaceRecognitionEngine
+        self.recognizer = FaceRecognitionEngine(project_root=PROJECT_ROOT)
+        self.recognizer.initialize(self.employee_manager)
+
+        from ai.session_engine import EmployeeSessionEngine
+        self.session_engine = EmployeeSessionEngine()
+
         # Ensure output directory exists.
         os.makedirs(settings.OUTPUT_DIR, exist_ok=True)
 
-    def _write_json(self, cam_id: str, ts: datetime, persons: list[dict]):
+    def _write_json(self, cam_id: str, ts: datetime, persons: list):
+        person_list = []
+        for p in persons:
+            person_list.append({
+                "track_id": p.track_id,
+                "bbox": p.bbox,
+                "status": p.status,
+                "recognition_status": p.recognition_status,
+                "employee_id": p.employee_id,
+                "employee_name": p.employee_name,
+                "phone_use_detected": p.phone_use_detected,
+                "phone_use_duration": round(p.phone_use_duration, 2),
+                "total_tracked_duration": round(p.total_tracked_duration, 2),
+                "productivity_score": round(p.productivity_score, 1)
+            })
+
         payload = {
             "camera_id": cam_id,
             "timestamp": ts.isoformat(),
-            "persons": persons,
+            "persons": person_list,
         }
         filename = f"{cam_id}_{ts.strftime('%Y%m%d_%H%M%S_%f')}.json"
         out_path = os.path.join(settings.OUTPUT_DIR, filename)
@@ -58,28 +87,75 @@ class MonitoringService:
             json.dump(payload, f, ensure_ascii=False, indent=2)
 
     def run(self):
-        """Start the processing loop.
-
-        The loop runs until ``max_frames`` is reached (if set) or the user
-        interrupts with ``Ctrl‑C``.  Frames are read from ``CameraManager`` as a
-        generator yielding ``(cam_id, frame, ts)`` tuples.
-        """
+        """Start the CCTV monitoring loop."""
         self.camera_manager.start_all()
         try:
             for cam_id, frame, ts in self.camera_manager.read_frames():
-                # Detection – returns a list of ``Detection`` objects.
-                detections = self.detector.detect(frame)
-                # Tracking – produces a list of ``Track`` objects.
-                tracks = self.tracker.update(detections)
-                # Person state – convert tracks to per‑person dicts.
-                person_states = self.person_manager.process_tracks(tracks, ts)
-                # Render annotation.
+                if frame is None or frame.size == 0:
+                    continue
+
+                # 1. Detection - get both persons and phone detections
+                all_detections = self.detector.detect(frame)
+                
+                # Separate detections
+                person_dets = [d for d in all_detections if d.class_id == 0]
+                phone_dets = [d for d in all_detections if d.class_id == 67]
+
+                # 2. Tracking - track persons persistently
+                tracks = self.tracker.update(person_dets)
+
+                # 3. Update track lifecycle and perform phone overlap checks
+                person_states = self.person_manager.process_tracks_with_phones(
+                    camera_id=cam_id,
+                    timestamp=ts,
+                    tracks=tracks,
+                    phone_detections=phone_dets
+                )
+
+                # 4. Face Recognition on Cropped regions for unidentified tracks
+                for p in person_states:
+                    if p.status == "tracking":
+                        # Crop region only if they are not yet identified
+                        if p.recognition_status != "identified":
+                            px1, py1, px2, py2 = p.bbox
+                            h, w = frame.shape[:2]
+                            px1, py1 = max(0, px1), max(0, py1)
+                            px2, py2 = min(w, px2), min(h, py2)
+
+                            crop = frame[py1:py2, px1:px2]
+                            if crop.size > 0:
+                                face_res = self.recognizer.recognize_crop(crop)
+                                if face_res.get("matched"):
+                                    p.recognition_status = "identified"
+                                    p.employee_id = face_res["employee_id"]
+                                    p.employee_name = face_res["employee_name"]
+                                    
+                                    # Trigger attendance logging
+                                    self.session_engine.process_recognition(
+                                        employee_id=p.employee_id,
+                                        employee_name=p.employee_name,
+                                        confidence=face_res["confidence"],
+                                        timestamp=ts
+                                    )
+                                else:
+                                    p.recognition_status = "unknown"
+                                    p.employee_name = "Unknown"
+                                    p.employee_id = None
+                        
+                        # Re-verify matching state mapping
+                        if p.recognition_status != "identified":
+                            p.employee_name = "Unknown"
+                            p.employee_id = None
+
+                # 5. Visual Render
+                fps = self.camera_manager.get_fps(cam_id)
                 annotated = self.renderer.draw(
                     frame=frame,
                     persons=person_states,
-                    fps=self.tracker.get_fps(),
+                    fps=fps,
                 )
-                # Write JSON output.
+
+                # 6. JSON output logging
                 self._write_json(cam_id, ts, person_states)
 
                 if self.display:

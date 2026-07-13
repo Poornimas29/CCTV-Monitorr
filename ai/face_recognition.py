@@ -77,9 +77,10 @@ class FaceRecognitionEngine:
             image_paths = employee_manager.get_employee_images(emp_id)
             cache_entry = cache_payload.get(emp_id)
 
+            expected_dim = 512 if self._backend_name == "insightface" else 4096
             if cache_entry and int(cache_entry.get("image_count", 0)) == len(image_paths):
                 embedding = np.asarray(cache_entry.get("embedding", []), dtype=np.float32)
-                if embedding.size:
+                if embedding.size == expected_dim:
                     self._employee_embeddings[emp_id] = {
                         "employee_id": emp_id,
                         "name": employee.get("name", emp_id),
@@ -163,6 +164,49 @@ class FaceRecognitionEngine:
         )
         self._debug_print("\n".join(debug_lines))
 
+        return {
+            "employee_id": best_employee_id if matched else None,
+            "employee_name": best_name if matched else "Unknown",
+            "confidence": round(float(best_similarity * 100.0), 1) if matched else 0.0,
+            "matched": matched,
+            "bbox": best_bbox,
+            "embedding": best_embedding,
+            "status": "recognized" if matched else "unknown",
+            "similarity": round(float(best_similarity), 3),
+        }
+
+    def recognize_crop(self, crop: Optional[np.ndarray]) -> Dict[str, Any]:
+        """Recognize a face within a cropped person image."""
+        if crop is None or crop.size == 0:
+            return self._unknown_result()
+
+        detections = self._detect_faces(crop)
+        if not detections:
+            return {**self._unknown_result(), "status": "no_face"}
+
+        best_employee_id: Optional[str] = None
+        best_name: str = "Unknown"
+        best_similarity = 0.0
+        best_bbox: Optional[Tuple[int, int, int, int]] = None
+        best_embedding: Optional[np.ndarray] = None
+
+        for detection in detections:
+            embedding = detection.get("embedding")
+            if embedding is None:
+                embedding = self._build_embedding(detection.get("face"))
+            if embedding is None or not self._employee_embeddings:
+                continue
+
+            for emp_id, record in self._employee_embeddings.items():
+                similarity = self._cosine_similarity(embedding, record["embedding"])
+                if similarity > best_similarity:
+                    best_similarity = similarity
+                    best_employee_id = emp_id
+                    best_name = record.get("name", emp_id)
+                    best_bbox = detection.get("bbox")
+                    best_embedding = embedding
+
+        matched = best_employee_id is not None and best_similarity >= self._threshold
         return {
             "employee_id": best_employee_id if matched else None,
             "employee_name": best_name if matched else "Unknown",
@@ -332,6 +376,8 @@ class FaceRecognitionEngine:
         return embedding / norm
 
     def _cosine_similarity(self, left: np.ndarray, right: np.ndarray) -> float:
+        if left.shape != right.shape:
+            return 0.0
         left_norm = np.linalg.norm(left)
         right_norm = np.linalg.norm(right)
         if left_norm == 0.0 or right_norm == 0.0:

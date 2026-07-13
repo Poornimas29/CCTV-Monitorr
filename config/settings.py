@@ -4,15 +4,15 @@ Loads environment variables from a .env file and provides typed settings.
 """
 
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
-load_dotenv()
+# Load .env from project root
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
 
 # RTSP Stream Settings
 RTSP_URL: str = os.getenv("RTSP_URL", "mock")
-
-# RTSP Server Base Connection details (loaded dynamically from environment, no hardcoded fallbacks)
 RTSP_HOST: str = os.getenv("RTSP_HOST", "")
 RTSP_USERNAME: str = os.getenv("RTSP_USERNAME", "")
 RTSP_PASSWORD: str = os.getenv("RTSP_PASSWORD", "")
@@ -20,6 +20,9 @@ try:
     RTSP_PORT: int = int(os.getenv("RTSP_PORT", "0"))
 except ValueError:
     RTSP_PORT = 0
+
+
+
 
 # Camera Configuration List
 CAMERAS: list[dict] = [
@@ -38,7 +41,7 @@ CAMERAS: list[dict] = [
     {
         "id": "CAM003",
         "name": "Packing Area",
-        "channel": 3,
+        "channel": 4,
         "enabled": True
     }
 ]

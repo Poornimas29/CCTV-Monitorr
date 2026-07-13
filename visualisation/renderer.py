@@ -45,19 +45,59 @@ class Renderer:
         """
         overlay = frame.copy()
         for p in persons:
-            color = self._color_for_id(p.track_id)
             x1, y1, x2, y2 = p.bbox
-            cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
+            
+            # Determine color and text depending on recognition status
+            if p.recognition_status == "identified":
+                if p.phone_use_detected:
+                    color = (40, 40, 255)  # Red warning color if using phone
+                else:
+                    color = (40, 220, 40)  # Green for identified
+                name_label = f"[{p.track_id}] {p.employee_name}"
+            else:
+                color = (0, 140, 255)  # Orange for unknown
+                name_label = f"[{p.track_id}] Unknown"
+            
+            thickness = 3 if (p.recognition_status == "identified" and p.phone_use_detected) else 2
+            
+            # Draw person bbox
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), color, thickness)
+            
+            # Draw top text label background
+            label_size = cv2.getTextSize(name_label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)[0]
+            cv2.rectangle(overlay, (x1, y1 - 20), (x1 + label_size[0] + 10, y1), color, -1)
+            # Draw label text
             cv2.putText(
                 overlay,
-                f"ID:{p.track_id}",
-                (x1, y1 - 6),
+                name_label,
+                (x1 + 5, y1 - 5),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                color,
+                0.5,
+                (255, 255, 255),
                 2,
                 cv2.LINE_AA,
             )
+            
+            # Draw productivity info for identified employees
+            if p.recognition_status == "identified":
+                prod_text = f"Prod: {p.productivity_score:.1f}% | Phone: {p.phone_use_duration:.1f}s"
+                if p.phone_use_detected:
+                    prod_text += " [USING PHONE]"
+                
+                prod_size = cv2.getTextSize(prod_text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)[0]
+                # Draw bottom text background
+                cv2.rectangle(overlay, (x1, y2), (x1 + prod_size[0] + 10, y2 + 20), (20, 20, 20), -1)
+                # Draw bottom text
+                cv2.putText(
+                    overlay,
+                    prod_text,
+                    (x1 + 5, y2 + 15),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    (200, 255, 200) if not p.phone_use_detected else (150, 150, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
         # FPS and total count overlay (semi‑transparent black bar).
         h, w = frame.shape[:2]
         bar_h = 40
