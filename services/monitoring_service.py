@@ -43,8 +43,10 @@ class MonitoringService:
         self.frame_counter = 0
 
         # Initialize per-camera state managers
+        from person_management.employee_session_manager import EmployeeSessionManager
         self.trackers = {}
-        self.person_managers = {}
+        self.session_managers = {}
+        self.unrecognized_tracks = {}
         
         # Initialise shared pipeline modules
         self.camera_manager = CameraManager()
@@ -88,20 +90,33 @@ class MonitoringService:
         cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
         return hist
 
-    def _write_json(self, cam_id: str, ts: datetime, persons: list):
+    def _write_json(self, cam_id: str, ts: datetime, sessions: list, unrecognized_tracks: list):
         person_list = []
-        for p in persons:
+        for s in sessions:
             person_list.append({
-                "track_id": p.track_id,
-                "bbox": p.bbox,
-                "status": p.status,
-                "recognition_status": p.recognition_status,
-                "employee_id": p.employee_id,
-                "employee_name": p.employee_name,
-                "phone_use_detected": p.phone_use_detected,
-                "phone_use_duration": round(p.phone_use_duration, 2),
-                "total_tracked_duration": round(p.total_tracked_duration, 2),
-                "productivity_score": round(p.productivity_score, 1)
+                "track_id": s.track_id,
+                "bbox": s.bbox,
+                "status": s.status,
+                "recognition_status": "identified",
+                "employee_id": s.employee_id,
+                "employee_name": s.employee_name,
+                "phone_use_detected": s.phone_use_detected,
+                "phone_use_duration": round(s.phone_use_duration, 2),
+                "total_tracked_duration": round(s.total_tracked_duration, 2),
+                "productivity_score": round(s.productivity_score, 1)
+            })
+        for utrk in unrecognized_tracks:
+            person_list.append({
+                "track_id": utrk["track_id"],
+                "bbox": utrk["bbox"],
+                "status": "tracking",
+                "recognition_status": "unknown",
+                "employee_id": None,
+                "employee_name": "Unknown",
+                "phone_use_detected": False,
+                "phone_use_duration": 0.0,
+                "total_tracked_duration": 0.0,
+                "productivity_score": 100.0
             })
 
         payload = {
@@ -116,12 +131,16 @@ class MonitoringService:
 
     def process_camera_frame(self, cam_id: str, frame: np.ndarray, ts: datetime):
         """Process a single frame for a specific camera through the entire pipeline."""
+        self.frame_counter += 1
         if cam_id not in self.trackers:
             self.trackers[cam_id] = Tracker()
-            self.person_managers[cam_id] = PersonManager()
+            from person_management.employee_session_manager import EmployeeSessionManager
+            self.session_managers[cam_id] = EmployeeSessionManager()
+            self.unrecognized_tracks[cam_id] = {}
             
         tracker = self.trackers[cam_id]
-        person_manager = self.person_managers[cam_id]
+        session_manager = self.session_managers[cam_id]
+        prev_unreg_tracks = self.unrecognized_tracks[cam_id]
 
         # 1. Detection - get both persons and phone detections
         all_detections = self.detector.detect(frame)
@@ -133,117 +152,235 @@ class MonitoringService:
         # 2. Tracking - track persons persistently
         tracks = tracker.update(person_dets)
 
-        # 3. Update track lifecycle and perform phone overlap checks
-        person_states = person_manager.process_tracks_with_phones(
-            camera_id=cam_id,
-            timestamp=ts,
-            tracks=tracks,
-            phone_detections=phone_dets
-        )
+        # 3. Update active sessions and unrecognized tracks
+        current_track_ids = {t.track_id for t in tracks}
+        
+        # Mark active sessions that are not in the current frame as "lost"
+        for session in session_manager.sessions.values():
+            if session.status == "tracking" and session.track_id not in current_track_ids:
+                session.status = "lost"
+                session.prev_seen = session.last_seen
+                print("----------------------")
+                print("Track Lost")
+                print(f"Track {session.track_id}")
+                print("Searching Lost Registry")
+                print("----------------------")
+                logger.info("Track Lost - Track ID %d, searching lost registry", session.track_id)
 
-        # 4. Face ReID and Face Recognition on Cropped regions
-        for p in person_states:
-            if p.status == "tracking":
-                # Periodically update appearance histogram
-                if getattr(p, "reid_hist", None) is None or p.frame_count % 10 == 0:
-                    p.reid_hist = self._compute_appearance_histogram(frame, p.bbox)
+        active_unrecognized_tracks = {}
 
-                # Try ReID on first frame of a new track
-                if p.frame_count == 1 and p.reid_hist is not None:
+        # 4. Map track lifecycle and try ReID / Face recognition
+        for trk in tracks:
+            session = session_manager.get_session_by_track_id(trk.track_id)
+            if session is not None:
+                # Update identified employee session
+                session_manager.update_session(session, trk.bbox, ts)
+                session_manager.update_metrics(session, phone_dets)
+            else:
+                # This track is not bound to a session. Check if it's in our previous unrecognized list
+                prev_unreg = prev_unreg_tracks.get(trk.track_id)
+                if prev_unreg is None:
+                    # New Track! Try ReID recovery against lost sessions
+                    recomputed_hist = self._compute_appearance_histogram(frame, trk.bbox)
+                    
                     best_reid_score = -1.0
-                    best_candidate = None
-                    best_candidate_dist = 0.0
+                    best_session = None
+                    best_session_dist = 0.0
 
-                    p_cx = (p.bbox[0] + p.bbox[2]) / 2.0
-                    p_cy = (p.bbox[1] + p.bbox[3]) / 2.0
+                    p_cx = (trk.bbox[0] + trk.bbox[2]) / 2.0
+                    p_cy = (trk.bbox[1] + trk.bbox[3]) / 2.0
 
-                    for other in person_manager._persons.values():
-                        if other.track_id != p.track_id and other.status in ("lost", "exited") and getattr(other, "reid_hist", None) is not None:
-                            if ts - other.last_seen <= timedelta(seconds=15):
-                                other_cx = (other.bbox[0] + other.bbox[2]) / 2.0
-                                other_cy = (other.bbox[1] + other.bbox[3]) / 2.0
-                                dist = np.sqrt((p_cx - other_cx)**2 + (p_cy - other_cy)**2)
+                    if recomputed_hist is not None:
+                        for s in session_manager.sessions.values():
+                            if s.status == "lost" and getattr(s, "reid_hist", None) is not None:
+                                if ts - s.last_seen <= timedelta(seconds=30):
+                                    other_cx = (s.bbox[0] + s.bbox[2]) / 2.0
+                                    other_cy = (s.bbox[1] + s.bbox[3]) / 2.0
+                                    dist = np.sqrt((p_cx - other_cx)**2 + (p_cy - other_cy)**2)
 
-                                if dist < 400.0:
-                                    score = cv2.compareHist(p.reid_hist, other.reid_hist, cv2.HISTCMP_CORREL)
-                                    if score > best_reid_score:
-                                        best_reid_score = score
-                                        best_candidate = other
-                                        best_candidate_dist = dist
+                                    if dist < 400.0:
+                                        score = cv2.compareHist(recomputed_hist, s.reid_hist, cv2.HISTCMP_CORREL)
+                                        if score > best_reid_score:
+                                            best_reid_score = score
+                                            best_session = s
+                                            best_session_dist = dist
 
-                    if best_candidate is not None and best_reid_score >= 0.85:
-                        p.recognition_status = best_candidate.recognition_status
-                        p.employee_id = best_candidate.employee_id
-                        p.employee_name = best_candidate.employee_name
-                        p.recognition_confidence = getattr(best_candidate, "recognition_confidence", 0.0)
-                        p.session_start_time = getattr(best_candidate, "session_start_time", None)
-                        p.phone_use_duration = best_candidate.phone_use_duration
-                        p.productivity_score = best_candidate.productivity_score
-                        p.last_recognition_attempt = getattr(best_candidate, "last_recognition_attempt", None)
+                    if best_session is not None and best_reid_score >= 0.85:
+                        old_track_id = best_session.track_id
+                        # Reconnect track to this session
+                        best_session.track_id = trk.track_id
+                        best_session.bbox = trk.bbox
+                        best_session.last_seen = ts
+                        best_session.status = "tracking"
+                        best_session.logged_left = False # Reset flag in case it was set
                         
-                        # Mark the merged candidate as exited so it's not matched again
-                        best_candidate.status = "exited"
-                        
+                        print("----------------------")
+                        print("Track Changed")
+                        print(f"Employee ID: {best_session.employee_id}")
+                        print(f"Old Track ID: {old_track_id}")
+                        print(f"New Track ID: {trk.track_id}")
+                        print("Recovery Method: Torso ReID color histogram + spatial distance matching")
+                        print("----------------------")
                         logger.info(
-                            "[ReID] Track ID %d merged with recently lost Track ID %d (%s) - Score: %.4f, Dist: %.1f px",
-                            p.track_id, best_candidate.track_id, p.employee_name, best_reid_score, best_candidate_dist
+                            "[ReID] Reconnected Track ID %d to Employee Session %s (%s) - Score: %.4f",
+                            trk.track_id, best_session.session_id, best_session.employee_name, best_reid_score
                         )
+                    else:
+                        # ReID match failed. Log new track creation
+                        print("----------------------")
+                        print("New Track Created")
+                        print(f"Track {trk.track_id}")
+                        print("Unknown")
+                        print("----------------------")
+                        logger.info("New Track Created - Track ID %d, status: Unknown", trk.track_id)
+                        
+                        # Add to unrecognized tracks list
+                        active_unrecognized_tracks[trk.track_id] = {
+                            "track_id": trk.track_id,
+                            "bbox": trk.bbox,
+                            "face_bbox": None,
+                            "last_recognition_attempt": None
+                        }
+                else:
+                    # Update existing unrecognized track bbox
+                    prev_unreg["bbox"] = trk.bbox
+                    active_unrecognized_tracks[trk.track_id] = prev_unreg
 
-                # Crop region only if they are not yet identified
-                if p.recognition_status != "identified":
-                    # Check if retry interval has elapsed (5 seconds)
+        # 5. Process face detection & recognition on unrecognized tracks
+        for uid, utrk in active_unrecognized_tracks.items():
+            px1, py1, px2, py2 = utrk["bbox"]
+            h, w = frame.shape[:2]
+            px1, py1 = max(0, px1), max(0, py1)
+            px2, py2 = min(w, px2), min(h, py2)
+
+            crop = frame[py1:py2, px1:px2]
+            utrk["face_bbox"] = None # Reset face bbox for this frame
+
+            if crop.size > 0:
+                detections = self.recognizer._detect_faces(crop)
+                if detections:
+                    det = detections[0]
+                    fx, fy, fw, fh = det["bbox"]
+                    utrk["face_bbox"] = [px1 + fx, py1 + fy, px1 + fx + fw, py1 + fy + fh]
+
+                    # Check if retry interval has elapsed (2 seconds)
                     should_attempt = False
-                    last_attempt = getattr(p, "last_recognition_attempt", None)
-                    if last_attempt is None:
-                        should_attempt = True
-                    elif (ts - last_attempt).total_seconds() >= 5.0:
+                    last_attempt = utrk["last_recognition_attempt"]
+                    if last_attempt is None or (ts - last_attempt).total_seconds() >= 2.0:
                         should_attempt = True
 
                     if should_attempt:
-                        p.last_recognition_attempt = ts
-                        px1, py1, px2, py2 = p.bbox
-                        h, w = frame.shape[:2]
-                        px1, py1 = max(0, px1), max(0, py1)
-                        px2, py2 = min(w, px2), min(h, py2)
+                        utrk["last_recognition_attempt"] = ts
+                        face_res = self.recognizer.recognize_crop(crop, frame=frame)
+                        if face_res.get("matched"):
+                            # Face recognized! Create session and lock identity
+                            emp_id = face_res["employee_id"]
+                            emp_name = face_res["employee_name"]
+                            confidence = face_res["confidence"]
+                            session_id = f"SESS_{emp_id}_{ts.strftime('%Y%m%d_%H%M%S')}"
 
-                        crop = frame[py1:py2, px1:px2]
-                        if crop.size > 0:
-                            face_res = self.recognizer.recognize_crop(crop)
-                            if face_res.get("matched"):
-                                p.recognition_status = "identified"
-                                p.employee_id = face_res["employee_id"]
-                                p.employee_name = face_res["employee_name"]
-                                p.recognition_confidence = face_res["confidence"]
-                                p.session_start_time = ts
-                                
-                                # Trigger attendance logging
-                                self.session_engine.process_recognition(
-                                    employee_id=p.employee_id,
-                                    employee_name=p.employee_name,
-                                    confidence=face_res["confidence"],
-                                    timestamp=ts
-                                )
-                            else:
-                                p.recognition_status = "unknown"
-                                p.employee_name = "Unknown"
-                                p.employee_id = None
-                
-                # Re-verify matching state mapping
-                if p.recognition_status != "identified":
-                    p.employee_name = "Unknown"
-                    p.employee_id = None
+                            rehist = self._compute_appearance_histogram(frame, utrk["bbox"])
 
-        # 5. Visual Render
+                            session = session_manager.create_session(
+                                session_id=session_id,
+                                employee_id=emp_id,
+                                employee_name=emp_name,
+                                track_id=uid,
+                                camera_id=cam_id,
+                                bbox=utrk["bbox"],
+                                timestamp=ts,
+                                confidence=confidence,
+                                reid_hist=rehist
+                            )
+                            # Mark as recognized
+                            utrk["recognized"] = True
+
+                            # Trigger session engine logging
+                            self.session_engine.process_recognition(
+                                employee_id=emp_id,
+                                employee_name=emp_name,
+                                confidence=confidence,
+                                timestamp=ts
+                            )
+                            print("----------------------")
+                            print("Employee Session Started")
+                            print(f"Employee ID: {emp_id}")
+                            print(f"Employee Name: {emp_name}")
+                            print(f"Track ID: {uid}")
+                            print(f"Recognition Confidence: {confidence:.1f}%")
+                            print(f"Recognition Time: {ts:%Y-%m-%d %H:%M:%S}")
+                            print(f"Production Start Time: {ts:%Y-%m-%d %H:%M:%S}")
+                            print("----------------------")
+                            logger.info("Face Recognized - %s | Confidence: %.1f%% | Identity Locked", emp_name, confidence)
+                        else:
+                            if not utrk.get("logged_unknown", False):
+                                utrk["logged_unknown"] = True
+                                print("----------------------")
+                                print("Unknown face detected")
+                                print(f"Camera: {cam_id}")
+                                print(f"Track ID: {uid}")
+                                print(f"Time: {ts:%Y-%m-%d %H:%M:%S}")
+                                print("----------------------")
+
+        # Store unrecognized tracks
+        self.unrecognized_tracks[cam_id] = {
+            uid: utrk for uid, utrk in active_unrecognized_tracks.items()
+            if not utrk.get("recognized", False)
+        }
+
+        # 6. Clean up lost sessions that exceed the 30-second lost timeout
+        for sid in list(session_manager.sessions.keys()):
+            session = session_manager.sessions[sid]
+            if session.status == "lost":
+                if ts - session.last_seen > session_manager.lost_timeout:
+                    if not getattr(session, "logged_left", False):
+                        session.logged_left = True
+                        duration_str = "0s"
+                        if session.first_seen is not None:
+                            duration_sec = (session.last_seen - session.first_seen).total_seconds()
+                            m, s = divmod(int(duration_sec), 60)
+                            h, m = divmod(m, 60)
+                            duration_str = f"{h}h {m}m {s}s"
+                        print("----------------------")
+                        print("Employee Session Ended")
+                        print(f"Employee ID: {session.employee_id}")
+                        print(f"Employee Name: {session.employee_name}")
+                        print(f"Production End Time: {session.last_seen:%Y-%m-%d %H:%M:%S}")
+                        print(f"Working Duration: {duration_str}")
+                        print("----------------------")
+                        logger.info("Employee Left - %s | Duration: %s", session.employee_name, duration_str)
+                    
+                    # Mark as exited and remove
+                    session.status = "exited"
+                    del session_manager.sessions[sid]
+
+        # 7. Visual Render
         fps = self.camera_manager.get_fps(cam_id)
+        active_sessions = [s for s in session_manager.sessions.values() if s.status != "exited"]
+        unreg_list = list(self.unrecognized_tracks[cam_id].values())
+        
         annotated = self.renderer.draw(
             frame=frame,
-            persons=person_states,
+            sessions=active_sessions,
+            unrecognized_tracks=unreg_list,
             fps=fps,
         )
 
-        # 6. JSON output logging
-        self._write_json(cam_id, ts, person_states)
-        return annotated, person_states
+        # 8. JSON output logging (Disabled temporarily)
+        # self._write_json(cam_id, ts, active_sessions, unreg_list)
+
+        # Print frame-by-frame debug logs for active recognized employees
+        for s in active_sessions:
+            if s.status == "tracking":
+                print("----------------------")
+                print(f"Frame Number: {self.frame_counter}")
+                print(f"Employee ID: {s.employee_id}")
+                print(f"Track ID: {s.track_id}")
+                print(f"Current Bounding Box: {s.bbox}")
+                print(f"Previous Bounding Box: {s.prev_bbox if s.prev_bbox is not None else s.bbox}")
+                print("----------------------")
+
+        return annotated, active_sessions
 
     def run(self):
         """Start the CCTV monitoring loop."""

@@ -45,7 +45,6 @@ class EmployeeSessionEngine:
                 employee_name,
                 confidence,
             )
-            print(f"[{now:%H:%M:%S}] Employee Recognized | {employee_id} | {employee_name} | Confidence : {confidence:.1f}% | Existing Session Updated")
             return existing, "updated"
 
         session = {
@@ -63,7 +62,6 @@ class EmployeeSessionEngine:
             employee_name,
             confidence,
         )
-        print(f"[{now:%H:%M:%S}] Employee Recognized | {employee_id} | {employee_name} | Confidence : {confidence:.1f}% | Session Started")
         return session, "started"
 
     def get_active_sessions(self) -> Dict[str, Dict[str, Any]]:

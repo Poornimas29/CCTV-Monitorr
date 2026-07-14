@@ -165,18 +165,11 @@ def main() -> None:
 
     manager.start_all()
 
-    project_root = os.path.abspath(os.path.dirname(__file__))
-    employee_manager = EmployeeManager(project_root=project_root)
-    employee_manager.load_employees()
-
-    recognizer = FaceRecognitionEngine(project_root=project_root)
-    recognition_summary = recognizer.initialize(employee_manager)
-    session_engine = EmployeeSessionEngine()
+    from services.monitoring_service import MonitoringService
+    monitoring_service = MonitoringService(display=False)
     print("----------------------------------")
-    print("Face Recognition Initialized")
-    print(f"Registered Employees : {recognition_summary['registered_employees']}")
-    print(f"Total Face Images : {recognition_summary['total_face_images']}")
-    print("Embeddings Loaded Successfully")
+    print("Persistent CCTV Analytics System Active")
+    print("Continuous Body Tracking Enabled")
     print("----------------------------------")
 
     # Pre-compute stable lookup structures for the renderer
@@ -213,16 +206,10 @@ def main() -> None:
             for cam_id in camera_ids:
                 frame = frames.get(cam_id)
                 if frame is not None and connected_map.get(cam_id, False):
-                    frames[cam_id], recognition_result = recognizer.process_frame(
-                        frame,
-                        camera_name=camera_names.get(cam_id, cam_id),
+                    annotated, person_states = monitoring_service.process_camera_frame(
+                        cam_id, frame, datetime.datetime.now()
                     )
-                    if recognition_result.get("status") == "recognized":
-                        session_engine.process_recognition(
-                            employee_id=recognition_result.get("employee_id"),
-                            employee_name=recognition_result.get("employee_name"),
-                            confidence=recognition_result.get("confidence", 0.0),
-                        )
+                    frames[cam_id] = annotated
 
             # ── Build and display the single dashboard frame ──────────────────
             dashboard = renderer.build_dashboard(

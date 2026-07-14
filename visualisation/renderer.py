@@ -31,62 +31,74 @@ class Renderer:
             )
         return self._colors[track_id]
 
-    def draw(self, frame, persons: List[PersonState], fps: float = 0.0):
+    def draw(self, frame, sessions: List[Any], unrecognized_tracks: List[dict], fps: float = 0.0):
         """Draw bounding boxes and overlay information on *frame*.
 
         Parameters
         ----------
         frame: np.ndarray
             BGR image to annotate.
-        persons: List[PersonState]
-            Current persons to visualise.
+        sessions: List[EmployeeSession]
+            Active employee tracking sessions.
+        unrecognized_tracks: List[dict]
+            Active unrecognized tracking candidates.
         fps: float, optional
             Frames‑per‑second value for the overlay.
         """
         overlay = frame.copy()
-        for p in persons:
-            if p.status != "tracking":
+        
+        # 1. Draw unrecognized tracks (ONLY face boxes, no body box)
+        for utrk in unrecognized_tracks:
+            face_bbox = utrk.get("face_bbox")
+            if face_bbox is not None:
+                fx1, fy1, fx2, fy2 = face_bbox
+                cv2.rectangle(overlay, (fx1, fy1), (fx2, fy2), (0, 140, 255), 2)
+                
+                # Draw "Unknown" label
+                label = "Unknown"
+                size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)[0]
+                cv2.rectangle(overlay, (fx1, max(0, fy1 - 18)), (fx1 + size[0] + 10, fy1), (20, 20, 20), -1)
+                cv2.putText(
+                    overlay,
+                    label,
+                    (fx1 + 5, max(12, fy1 - 5)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    (255, 255, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+
+        # 2. Draw active recognized employee sessions (ONLY body box, no face box)
+        for s in sessions:
+            if s.status != "tracking":
                 continue
                 
-            x1, y1, x2, y2 = p.bbox
-            
-            # Determine color and text depending on recognition status
-            lines = []
-            if p.recognition_status == "identified":
-                if p.phone_use_detected:
-                    color = (40, 40, 255)  # Red warning color if using phone
-                else:
-                    color = (40, 220, 40)  # Green for identified
-                
-                # Compute session duration
-                session_start = getattr(p, "session_start_time", None)
-                if session_start is not None:
-                    duration_sec = (p.last_seen - session_start).total_seconds()
-                    m, s = divmod(int(duration_sec), 60)
-                    h, m = divmod(m, 60)
-                    session_time = f"{h:02d}:{m:02d}:{s:02d}"
-                else:
-                    session_time = "00:00:00"
-
-                lines = [
-                    f"Employee: {p.employee_name}",
-                    f"ID: {p.employee_id} | Track: {p.track_id}",
-                    f"Match: {getattr(p, 'recognition_confidence', 0.0):.1f}% | Status: Active",
-                    f"Prod Timer: {session_time}",
-                    f"Prod Score: {p.productivity_score:.1f}%"
-                ]
-                if p.phone_use_detected:
-                    lines.append(f"Phone Use: {p.phone_use_duration:.1f}s [WARNING]")
+            x1, y1, x2, y2 = s.bbox
+            if s.phone_use_detected:
+                color = (40, 40, 255)  # Red warning color if using phone
             else:
-                color = (0, 140, 255)  # Orange for unknown
-                lines = [
-                    f"Track: {p.track_id}",
-                    "Status: Unknown"
-                ]
+                color = (40, 220, 40)  # Green for identified
             
-            thickness = 3 if (p.recognition_status == "identified" and p.phone_use_detected) else 2
+            # Compute session duration
+            duration_sec = (s.last_seen - s.first_seen).total_seconds()
+            m, s_val = divmod(int(duration_sec), 60)
+            h, m = divmod(m, 60)
+            session_time = f"{h:02d}:{m:02d}:{s_val:02d}"
+
+            lines = [
+                f"Employee: {s.employee_name}",
+                f"ID: {s.employee_id} | Session: {s.session_id}",
+                f"Track: {s.track_id} | Match: {getattr(s, 'recognition_confidence', 0.0):.1f}%",
+                f"Prod Timer: {session_time}",
+                f"Prod Score: {s.productivity_score:.1f}%"
+            ]
+            if s.phone_use_detected:
+                lines.append(f"Phone Use: {s.phone_use_duration:.1f}s [WARNING]")
+        
+            thickness = 3 if s.phone_use_detected else 2
             
-            # Draw person bbox
+            # Draw person body bbox
             cv2.rectangle(overlay, (x1, y1), (x2, y2), color, thickness)
             
             # Draw multi-line text block below the bounding box
@@ -104,7 +116,7 @@ class Renderer:
             
             # Draw each line
             for i, line in enumerate(lines):
-                text_color = (200, 255, 200) if p.recognition_status == "identified" else (255, 255, 255)
+                text_color = (200, 255, 200)
                 if "[WARNING]" in line:
                     text_color = (100, 100, 255)
                 
@@ -133,7 +145,7 @@ class Renderer:
         )
         cv2.putText(
             overlay,
-            f"Persons: {len(persons)}",
+            f"Persons: {len(sessions) + len(unrecognized_tracks)}",
             (w - 180, 28),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.9,

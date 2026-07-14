@@ -1,14 +1,12 @@
 # detection/yolo26_detector.py
-"""YOLO-26 person and phone detector (CPU-only singleton).
+"""YOLO detector using the official Ultralytics API.
 
-This module provides a `YOLO26Detector` class that loads a YOLO-26 model
-once and re-uses it for every frame. If torch or the model file is not available,
-it falls back to a simulated detection mode to keep the system runnable.
+This module provides a `YOLO26Detector` class that loads a YOLO model using the
+official Ultralytics API. It runs inference for person and cell phone classes.
 """
 
 import logging
 import numpy as np
-import time
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List
@@ -17,21 +15,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class Detection:
-    """Simple detection container returned by the detector.
-
-    Attributes
-    ----------
-    bbox: List[int]
-        Bounding box as [x1, y1, x2, y2] in pixel coordinates.
-    confidence: float
-        Confidence score from the model.
-    class_id: int
-        COCO class ID (0 for person, 67 for cell phone).
-    label: str
-        Label name ("person" or "cell_phone").
-    track_candidate: bool
-        Flag used by the tracker - always True for person detections.
-    """
+    """Simple detection container returned by the detector."""
     bbox: List[int]
     confidence: float
     class_id: int = 0
@@ -40,7 +24,7 @@ class Detection:
 
 
 class YOLO26Detector:
-    """CPU-only singleton detector."""
+    """Singleton detector using the official Ultralytics API."""
     _instance = None
 
     def __new__(cls, model_path: str = ""):
@@ -56,54 +40,53 @@ class YOLO26Detector:
         return cls._instance
 
     def __init__(self, model_path: str = ""):
-        # Initialise only once even if called multiple times.
         if getattr(self, "_initialized", False):
             return
-        
+
+        import ultralytics
+        from ultralytics import YOLO
+
         self.model_path = Path(model_path) if model_path else None
         self.device = "cpu"
-        self.simulation = True
-        self.model = None
+
+        # Load custom model if provided, otherwise default to yolov8n.pt
+        model_name = str(self.model_path) if self.model_path else "yolov8n.pt"
 
         try:
-            import torch
-            if self.model_path and self.model_path.exists():
-                self.model = torch.hub.load(
-                    "ultralytics/yolov5",
-                    "custom",
-                    path=str(self.model_path),
-                    force_reload=False,
-                ).to(self.device)
-                self.model.conf = 0.4
-                self.simulation = False
-                logger.info("YOLO26Detector initialized with PyTorch model at: %s", self.model_path)
-            else:
-                logger.info("No custom YOLO model path specified. Loading base yolov5s from torch hub...")
-                self.model = torch.hub.load(
-                    "ultralytics/yolov5",
-                    "yolov5s",
-                    pretrained=True,
-                    force_reload=False,
-                ).to(self.device)
-                self.model.conf = 0.4
-                self.model.classes = [0, 67]  # Limit detections to person (0) and cell phone (67)
-                self.simulation = False
-                logger.info("YOLOv5s model loaded successfully from torch hub.")
+            self.model = YOLO(model_name)
+            self.model.to(self.device)
         except Exception as exc:
-            logger.warning("Could not load PyTorch YOLO detector: %s. Running in simulation mode.", exc)
+            raise RuntimeError(f"Failed to load YOLO model '{model_name}': {exc}")
+
+        # Print YOLO Detector Startup Report to Console exactly as requested
+        report = (
+            "\n--------------------------------\n"
+            "Detection Engine\n\n"
+            f"Model File: {model_name}\n"
+            "Framework: PyTorch (Ultralytics API)\n"
+            f"Ultralytics Version: {ultralytics.__version__}\n"
+            f"Device: {self.device}\n"
+            "Detection Classes: [0, 67]\n"
+            "Tracking: Class 0 (Person) Only passed to ByteTrack\n"
+            "--------------------------------"
+        )
+        print(report, flush=True)
+        logger.info(report)
 
         self._initialized = True
 
     def detect(self, frame: np.ndarray) -> List[Detection]:
         """Run inference on a single frame and return person and phone detections."""
-        if self.simulation or self.model is None:
-            return self._simulate_detections(frame)
+        if frame is None or frame.size == 0:
+            return []
 
-        try:
-            results = self.model(frame)
-            detections: List[Detection] = []
-            for *xyxy, conf, cls in results.xyxy[0].cpu().numpy():
-                cls_idx = int(cls)
+        # Run inference using ultralytics YOLO model on CPU
+        results = self.model(frame, conf=0.4, verbose=False)[0]
+        detections: List[Detection] = []
+
+        if results.boxes is not None:
+            for box in results.boxes:
+                cls_idx = int(box.cls[0].item())
                 if cls_idx == 0:
                     label = "person"
                 elif cls_idx == 67:
@@ -111,76 +94,15 @@ class YOLO26Detector:
                 else:
                     continue
 
-                x1, y1, x2, y2 = map(int, xyxy)
+                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                conf = float(box.conf[0].item())
                 detections.append(
                     Detection(
                         bbox=[x1, y1, x2, y2],
-                        confidence=float(conf),
+                        confidence=conf,
                         class_id=cls_idx,
                         label=label,
                         track_candidate=(cls_idx == 0)
                     )
                 )
-            return detections
-        except Exception as exc:
-            logger.error("YOLO inference failed: %s. Falling back to simulation.", exc)
-            return self._simulate_detections(frame)
-
-    def _simulate_detections(self, frame: np.ndarray) -> List[Detection]:
-        """Generate consistent simulated person and cell phone detections."""
-        if frame is None or frame.size == 0:
-            return []
-        
-        h, w = frame.shape[:2]
-        t = time.time()
-        detections: List[Detection] = []
-
-        # Simulate Person 1: Walking across the left/center of the screen
-        x1 = int((w * 0.2) + (w * 0.1) * np.sin(t * 0.4))
-        y1 = int((h * 0.3) + 20 * np.cos(t * 0.4))
-        x2 = x1 + int(w * 0.2)
-        y2 = y1 + int(h * 0.5)
-
-        # Clip bounds
-        x1, y1 = max(0, x1), max(0, y1)
-        x2, y2 = min(w, x2), min(h, y2)
-
-        detections.append(
-            Detection(bbox=[x1, y1, x2, y2], confidence=0.88, class_id=0, label="person")
-        )
-
-        # Simulate Person 2: Static on the right side of the screen
-        x3 = int(w * 0.65)
-        y3 = int(h * 0.25)
-        x4 = x3 + int(w * 0.18)
-        y4 = y3 + int(h * 0.6)
-
-        x3, y3 = max(0, x3), max(0, y3)
-        x4, y4 = min(w, x4), min(h, y4)
-
-        detections.append(
-            Detection(bbox=[x3, y3, x4, y4], confidence=0.82, class_id=0, label="person")
-        )
-
-        # Simulate a Phone Usage for Person 1 (active for 4 seconds, inactive for 4 seconds)
-        if int(t) % 8 < 4:
-            px_center = (x1 + x2) // 2
-            py_center = (y1 + y2) // 2
-            
-            # Draw phone near hand/chest area
-            ph_x1 = px_center - 15
-            ph_y1 = py_center - 10
-            ph_x2 = px_center + 15
-            ph_y2 = py_center + 10
-            
-            detections.append(
-                Detection(
-                    bbox=[ph_x1, ph_y1, ph_x2, ph_y2],
-                    confidence=0.76,
-                    class_id=67,
-                    label="cell_phone",
-                    track_candidate=False
-                )
-            )
-
         return detections

@@ -30,6 +30,8 @@ class PersonState:
     # Persistent recognition retry and appearance ReID
     last_recognition_attempt: Optional[datetime] = None
     reid_hist: Optional[Any] = None
+    face_bbox: Optional[List[int]] = None
+    session_id: Optional[str] = None
     
     # Enriched state fields for employee productivity monitoring
     phone_use_detected: bool = False
@@ -41,7 +43,7 @@ class PersonState:
 
 class PersonManager:
     """Manage a collection of PersonState objects."""
-    LOST_TIMEOUT = timedelta(seconds=2)
+    LOST_TIMEOUT = timedelta(seconds=30)
 
     def __init__(self) -> None:
         self._persons: Dict[int, PersonState] = {}

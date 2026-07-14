@@ -1,9 +1,9 @@
-"""InsightFace-based face recognition for registered employees.
+# ai/face_recognition.py
+"""InsightFace-based face recognition engine for registered employees.
 
-This module replaces the previous custom matcher with a more robust backend
-that uses InsightFace when available for face detection, alignment, and
-embedding generation. It preserves the existing project interfaces so the
-streaming and dashboard modules continue to work unchanged.
+This module uses exclusively the InsightFace library to run face detection,
+alignment, and 512-dimensional embedding generation. It enforces a strict
+512-dimension constraint and avoids any legacy fallback mock embeddings.
 """
 
 from __future__ import annotations
@@ -21,13 +21,12 @@ logger = logging.getLogger(__name__)
 
 
 class FaceRecognitionEngine:
-    """Loads employee reference images and recognizes faces in camera frames."""
+    """Loads employee reference images and recognizes faces using InsightFace."""
 
     def __init__(
         self,
         project_root: Optional[str] = None,
         cache_path: Optional[str] = None,
-        detector_path: Optional[str] = None,
         threshold: float = 0.40,
         debug: bool = False,
     ) -> None:
@@ -37,48 +36,49 @@ class FaceRecognitionEngine:
 
         self._employee_embeddings: Dict[str, Dict[str, Any]] = {}
         self._employee_lookup: Dict[str, Dict[str, Any]] = {}
-        self._detector = None
         self._insightface_app = None
-        self._backend_name = "custom"
 
         # Load threshold from environment or parameter
         env_threshold = os.getenv("FACE_RECOGNITION_THRESHOLD")
         if env_threshold is not None:
             try:
-                threshold = float(env_threshold)
+                self._threshold = float(env_threshold)
             except ValueError:
-                pass
-        self._threshold = threshold
+                self._threshold = threshold
+        else:
+            self._threshold = threshold
+
         self._debug = debug
 
-        if detector_path:
-            self._detector = cv2.CascadeClassifier(detector_path)
-        else:
-            cascade_path = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
-            if cascade_path.exists():
-                self._detector = cv2.CascadeClassifier(str(cascade_path))
-
+        # Enforce InsightFace backend setup
         self._initialize_backend()
 
+        # Delete stale/legacy cache at startup to force rebuild using InsightFace
+        if self._cache_path.exists():
+            try:
+                self._cache_path.unlink()
+                logger.info("Deleted stale face embeddings cache file: %s", self._cache_path)
+            except Exception as exc:
+                logger.warning("Could not delete cache file: %s", exc)
+
     def _initialize_backend(self) -> None:
+        """Initialize the InsightFace application. Fail if unavailable."""
         try:
             from insightface.app import FaceAnalysis
 
             app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
             app.prepare(ctx_id=0, det_size=(640, 640))
             self._insightface_app = app
-            self._backend_name = "insightface"
             logger.info("InsightFace backend loaded successfully")
         except Exception as exc:
-            logger.warning("InsightFace backend unavailable; using OpenCV fallback: %s", exc)
-            self._backend_name = "custom"
+            raise RuntimeError(f"InsightFace backend is required but failed to load: {exc}")
 
     def initialize(self, employee_manager: Any) -> Dict[str, Any]:
-        """Load employee metadata, create or load embeddings, and cache results."""
+        """Load employee reference metadata, generate 512-d embeddings, and cache them."""
         employees = employee_manager.get_all_employees()
         self._employee_lookup = {emp["employee_id"]: emp for emp in employees}
 
-        cache_payload: Dict[str, Any] = self._load_cache()
+        cache_payload = self._load_cache()
         self._employee_embeddings = {}
 
         for employee in employees:
@@ -86,7 +86,7 @@ class FaceRecognitionEngine:
             image_paths = employee_manager.get_employee_images(emp_id)
             cache_entry = cache_payload.get(emp_id)
 
-            # Build current images metadata
+            # Build metadata for verification
             current_metadata = []
             for path_str in image_paths:
                 p = Path(path_str)
@@ -98,13 +98,10 @@ class FaceRecognitionEngine:
                         "size": stat.st_size
                     })
 
-            expected_dim = 512 if self._backend_name == "insightface" else 4096
-            cached_metadata = cache_entry.get("images_metadata") if cache_entry else None
             is_cache_valid = False
-
-            if cache_entry and cached_metadata and len(cached_metadata) == len(current_metadata):
+            if cache_entry and cache_entry.get("images_metadata") and len(cache_entry["images_metadata"]) == len(current_metadata):
                 matches = True
-                for c_meta, r_meta in zip(current_metadata, cached_metadata):
+                for c_meta, r_meta in zip(current_metadata, cache_entry["images_metadata"]):
                     if (c_meta["path"] != r_meta.get("path") or 
                         abs(c_meta["mtime"] - r_meta.get("mtime", 0.0)) > 0.1 or 
                         c_meta["size"] != r_meta.get("size")):
@@ -112,7 +109,7 @@ class FaceRecognitionEngine:
                         break
                 if matches:
                     embedding = np.asarray(cache_entry.get("embedding", []), dtype=np.float32)
-                    if embedding.size == expected_dim:
+                    if embedding.size == 512:
                         is_cache_valid = True
                         self._employee_embeddings[emp_id] = {
                             "employee_id": emp_id,
@@ -121,6 +118,11 @@ class FaceRecognitionEngine:
                             "image_count": len(image_paths),
                             "images_metadata": current_metadata,
                         }
+                    else:
+                        logger.warning(
+                            "Cached embedding for '%s' had invalid dimension (%d), rebuilding.",
+                            emp_id, embedding.size
+                        )
 
             if is_cache_valid:
                 continue
@@ -128,6 +130,11 @@ class FaceRecognitionEngine:
             embedding = self._build_employee_embedding(image_paths)
             if embedding is None:
                 continue
+
+            if embedding.size != 512:
+                raise ValueError(
+                    f"Generated embedding for employee '{emp_id}' is of size {embedding.size}, expected exactly 512 dimensions."
+                )
 
             self._employee_embeddings[emp_id] = {
                 "employee_id": emp_id,
@@ -147,36 +154,30 @@ class FaceRecognitionEngine:
         }
 
     def recognize_frame(self, frame: Optional[np.ndarray]) -> Dict[str, Any]:
-        """Identify the best-matching employee only when the similarity exceeds the threshold."""
+        """Identify the best-matching employee from a camera frame."""
         if frame is None or frame.size == 0:
-            self._debug_print("Frame Received: No\nNumber of Faces Detected: 0\nBest Match: None\nRecognition Threshold: {threshold}\nFinal Decision: Unknown")
             return {**self._unknown_result(), "status": "no_face"}
 
-        self._debug_print(f"Frame Received: Yes\nNumber of Faces Detected: evaluating")
         detections = self._detect_faces(frame)
         if not detections:
-            self._debug_print(
-                f"Frame Received: Yes\nNumber of Faces Detected: 0\nBest Match: None\nRecognition Threshold: {self._threshold:.2f}\nFinal Decision: Unknown"
-            )
             return {**self._unknown_result(), "bbox": None, "status": "no_face"}
+
+        if self._debug:
+            self._run_diagnostics(frame, None, detections)
 
         best_employee_id: Optional[str] = None
         best_name: str = "Unknown"
         best_similarity = 0.0
         best_bbox: Optional[Tuple[int, int, int, int]] = None
         best_embedding: Optional[np.ndarray] = None
-        similarity_details: List[str] = []
 
         for detection in detections:
             embedding = detection.get("embedding")
-            if embedding is None:
-                embedding = self._build_embedding(detection.get("face"))
             if embedding is None or not self._employee_embeddings:
                 continue
 
             for emp_id, record in self._employee_embeddings.items():
                 similarity = self._cosine_similarity(embedding, record["embedding"])
-                similarity_details.append(f"{emp_id}: {similarity:.4f}")
                 if similarity > best_similarity:
                     best_similarity = similarity
                     best_employee_id = emp_id
@@ -185,21 +186,23 @@ class FaceRecognitionEngine:
                     best_embedding = embedding
 
         matched = best_employee_id is not None and best_similarity >= self._threshold
-        decision = "Recognized" if matched else "Unknown"
-        debug_lines = [
-            "Frame Received: Yes",
-            f"Number of Faces Detected: {len(detections)}",
-        ]
-        if similarity_details:
-            debug_lines.extend(similarity_details)
-        debug_lines.extend(
-            [
+
+        if self._debug:
+            decision = "Recognized" if matched else "Unknown"
+            debug_lines = [
+                "Frame Received: Yes",
+                f"Number of Faces Detected: {len(detections)}",
+            ]
+            if best_employee_id:
+                debug_lines.append(f"{best_employee_id} : {best_similarity:.4f}")
+            debug_lines.extend([
                 f"Best Match: {best_employee_id or 'None'}",
                 f"Recognition Threshold: {self._threshold:.2f}",
                 f"Final Decision: {decision}",
-            ]
-        )
-        self._debug_print("\n".join(debug_lines))
+            ])
+            print("----------------------------------")
+            print("\n".join(debug_lines))
+            print("----------------------------------")
 
         return {
             "employee_id": best_employee_id if matched else None,
@@ -213,7 +216,7 @@ class FaceRecognitionEngine:
             "similarity": round(float(best_similarity), 3),
         }
 
-    def recognize_crop(self, crop: Optional[np.ndarray]) -> Dict[str, Any]:
+    def recognize_crop(self, crop: Optional[np.ndarray], frame: Optional[np.ndarray] = None) -> Dict[str, Any]:
         """Recognize a face within a cropped person image."""
         if crop is None or crop.size == 0:
             return self._unknown_result()
@@ -222,6 +225,9 @@ class FaceRecognitionEngine:
         if not detections:
             return {**self._unknown_result(), "status": "no_face"}
 
+        if self._debug:
+            self._run_diagnostics(frame, crop, detections)
+
         best_employee_id: Optional[str] = None
         best_name: str = "Unknown"
         best_similarity = 0.0
@@ -230,8 +236,6 @@ class FaceRecognitionEngine:
 
         for detection in detections:
             embedding = detection.get("embedding")
-            if embedding is None:
-                embedding = self._build_embedding(detection.get("face"))
             if embedding is None or not self._employee_embeddings:
                 continue
 
@@ -257,8 +261,68 @@ class FaceRecognitionEngine:
             "similarity": round(float(best_similarity), 3),
         }
 
+    def _run_diagnostics(
+        self,
+        frame: Optional[np.ndarray],
+        crop: Optional[np.ndarray],
+        detections: List[Dict[str, Any]],
+    ) -> None:
+        """Detailed prints. Only runs when debug=True."""
+        if not self._debug:
+            return
+
+        if not detections:
+            print("\n----------------------")
+            print("Detected Face: No")
+            print("[DIAGNOSTIC EXPLANATION]")
+            print("- Reason: No face detected in the image/crop.")
+            print("----------------------\n")
+            return
+
+        for idx, det in enumerate(detections):
+            print("\n----------------------")
+            print("Detected Face: Yes")
+
+            embedding = det.get("embedding")
+            emb_dim = len(embedding) if embedding is not None else 0
+            print(f"Embedding Size: {emb_dim}")
+
+            face_crop = det.get("face")
+
+            best_employee_id = None
+            best_similarity = -1.0
+
+            if embedding is not None and self._employee_embeddings:
+                for emp_id, record in self._employee_embeddings.items():
+                    sim = self._cosine_similarity(embedding, record["embedding"])
+                    print(f"{emp_id} : {sim:.4f}")
+                    if sim > best_similarity:
+                        best_similarity = sim
+                        best_employee_id = emp_id
+
+            matched = best_employee_id is not None and best_similarity >= self._threshold
+            decision = "Recognized" if matched else "Unknown"
+
+            print(f"Highest Match : {best_employee_id or 'None'}")
+            print(f"Threshold : {self._threshold:.2f}")
+            print(f"Decision : {decision}")
+
+            if not matched:
+                print("\n[DIAGNOSTIC EXPLANATION]")
+                if embedding is None:
+                    print("- Reason: Embedding generation failed completely.")
+                elif emb_dim != 512:
+                    print(f"- Reason: Embedding dimension mismatch ({emb_dim} vs expected 512).")
+                elif face_crop is not None and (face_crop.shape[1] < 45 or face_crop.shape[0] < 45):
+                    print(f"- Reason: Detected face is too small ({face_crop.shape[1]}x{face_crop.shape[0]} px).")
+                elif best_employee_id is None:
+                    print("- Reason: No registered employee matched.")
+                elif best_similarity < self._threshold:
+                    print(f"- Reason: Closest match is {best_employee_id} but similarity score ({best_similarity:.4f}) is below threshold ({self._threshold:.2f}).")
+            print("----------------------\n")
+
     def process_frame(self, frame: Optional[np.ndarray], camera_name: str = "Camera") -> Tuple[np.ndarray, Dict[str, Any]]:
-        """Annotate a frame with face recognition results and return both the frame and the result."""
+        """Annotate a frame with face recognition details."""
         if frame is None or frame.size == 0:
             return frame, self._unknown_result()
 
@@ -271,58 +335,10 @@ class FaceRecognitionEngine:
             color = (0, 220, 0) if result.get("matched") else (0, 165, 255)
             cv2.rectangle(annotated, (x, y), (x + w, y + h), color, 2)
 
-            if result.get("matched"):
-                label = f"{result['employee_id']} | {result['employee_name']}"
-                confidence_text = f"{result['confidence']:.1f}%"
-                cv2.putText(
-                    annotated,
-                    label,
-                    (x, max(20, y - 8)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (255, 255, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
-                cv2.putText(
-                    annotated,
-                    confidence_text,
-                    (x, y + h + 22),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55,
-                    (220, 220, 220),
-                    1,
-                    cv2.LINE_AA,
-                )
-                logger.info(
-                    "[%s] Recognized: %s | %s | Confidence: %.1f%%",
-                    camera_name,
-                    result["employee_id"],
-                    result["employee_name"],
-                    result["confidence"],
-                )
-            else:
-                cv2.putText(
-                    annotated,
-                    "Unknown",
-                    (x, max(20, y - 8)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
-                    (255, 255, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
-                logger.info(
-                    "[%s] Unknown face detected. Best match similarity: %.4f for %s (threshold: %.2f)",
-                    camera_name,
-                    result.get("similarity", 0.0),
-                    result.get("best_employee_id", "None"),
-                    self._threshold,
-                )
-
         return annotated, result
 
     def _build_employee_embedding(self, image_paths: list[str]) -> Optional[np.ndarray]:
+        """Load and extract a 512-dimension face embedding from multiple paths."""
         embeddings: list[np.ndarray] = []
         for image_path in image_paths:
             image = self._read_image(image_path)
@@ -332,9 +348,9 @@ class FaceRecognitionEngine:
             if not detections:
                 continue
             embedding = detections[0].get("embedding")
-            if embedding is None:
-                embedding = self._build_embedding(detections[0].get("face"))
             if embedding is not None:
+                if embedding.size != 512:
+                    raise ValueError(f"Extracted embedding dimension is {embedding.size}, expected exactly 512.")
                 embeddings.append(embedding)
 
         if not embeddings:
@@ -349,76 +365,39 @@ class FaceRecognitionEngine:
         return image if image is not None else None
 
     def _detect_faces(self, frame: np.ndarray) -> List[Dict[str, Any]]:
+        """Run face analysis using InsightFace and yield 512-d embeddings."""
         if frame is None or frame.size == 0:
             return []
 
-        if self._backend_name == "insightface" and self._insightface_app is not None:
-            try:
-                detections: List[Dict[str, Any]] = []
-                faces = self._insightface_app.get(frame)
-                for face in faces:
-                    x1, y1, x2, y2 = [int(v) for v in face.bbox]
-                    x1 = max(0, x1)
-                    y1 = max(0, y1)
-                    x2 = min(frame.shape[1], x2)
-                    y2 = min(frame.shape[0], y2)
-                    face_region = frame[y1:y2, x1:x2]
-                    if face_region.size == 0:
-                        continue
-                    embedding = getattr(face, "embedding", None)
-                    if embedding is not None:
-                        embedding = np.asarray(embedding, dtype=np.float32)
-                    detections.append({
-                        "bbox": (x1, y1, x2 - x1, y2 - y1),
-                        "face": face_region,
-                        "embedding": embedding,
-                    })
-                if detections:
-                    return detections
-            except Exception as exc:
-                logger.warning("InsightFace face detection failed: %s", exc)
+        if self._insightface_app is None:
+            raise RuntimeError("InsightFace application is not loaded.")
 
-        if self._detector is not None:
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            gray = cv2.equalizeHist(gray)
-            faces = self._detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
-            if len(faces) > 0:
-                detections = []
-                for x, y, w, h in faces:
-                    padding = 12
-                    x1 = max(0, x - padding)
-                    y1 = max(0, y - padding)
-                    x2 = min(frame.shape[1], x + w + padding)
-                    y2 = min(frame.shape[0], y + h + padding)
-                    face_region = frame[y1:y2, x1:x2]
-                    if face_region.size == 0:
-                        continue
-                    detections.append({
-                        "bbox": (x1, y1, x2 - x1, y2 - y1),
-                        "face": face_region,
-                        "embedding": None,
-                    })
-                if detections:
-                    return detections
-
-        if frame.mean() < 25.0:
-            return []
-
-        return [{"bbox": (0, 0, frame.shape[1], frame.shape[0]), "face": frame, "embedding": None}]
-
-    def _build_embedding(self, image: Optional[np.ndarray]) -> Optional[np.ndarray]:
-        if image is None or image.size == 0:
-            return None
-
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        gray = cv2.equalizeHist(gray)
-        resized = cv2.resize(gray, (64, 64), interpolation=cv2.INTER_AREA)
-        resized = cv2.GaussianBlur(resized, (5, 5), 0)
-        embedding = resized.astype(np.float32).reshape(-1) / 255.0
-        norm = np.linalg.norm(embedding)
-        if norm == 0.0:
-            return None
-        return embedding / norm
+        try:
+            detections: List[Dict[str, Any]] = []
+            faces = self._insightface_app.get(frame)
+            for face in faces:
+                x1, y1, x2, y2 = [int(v) for v in face.bbox]
+                x1, y1 = max(0, x1), max(0, y1)
+                x2 = min(frame.shape[1], x2)
+                y2 = min(frame.shape[0], y2)
+                face_region = frame[y1:y2, x1:x2]
+                if face_region.size == 0:
+                    continue
+                embedding = getattr(face, "embedding", None)
+                if embedding is not None:
+                    embedding = np.asarray(embedding, dtype=np.float32)
+                    if embedding.size != 512:
+                        raise ValueError(f"InsightFace embedding dimension is {embedding.size}, expected exactly 512.")
+                detections.append({
+                    "bbox": (x1, y1, x2 - x1, y2 - y1),
+                    "face": face_region,
+                    "embedding": embedding,
+                    "aimg": getattr(face, "aimg", None),
+                })
+            return detections
+        except Exception as exc:
+            logger.error("InsightFace face analysis failed: %s", exc)
+            raise
 
     def _cosine_similarity(self, left: np.ndarray, right: np.ndarray) -> float:
         if left.shape != right.shape:
@@ -464,10 +443,3 @@ class FaceRecognitionEngine:
             "embedding": None,
             "status": "unknown",
         }
-
-    def _debug_print(self, message: str) -> None:
-        if not self._debug:
-            return
-        print("----------------------------------")
-        print(message)
-        print("----------------------------------")
