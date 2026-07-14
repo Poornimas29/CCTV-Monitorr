@@ -42,11 +42,12 @@ class MonitoringService:
         self.display = display
         self.frame_counter = 0
 
-        # Initialize per-camera state managers
-        from person_management.employee_session_manager import EmployeeSessionManager
+        # Initialize per-camera state managers and global session manager
+        from session.global_session_manager import GlobalSessionManager
         self.trackers = {}
-        self.session_managers = {}
+        self.global_session_manager = GlobalSessionManager()
         self.unrecognized_tracks = {}
+        self.prev_bboxes = {}
         
         # Initialise shared pipeline modules
         self.camera_manager = CameraManager()
@@ -134,12 +135,9 @@ class MonitoringService:
         self.frame_counter += 1
         if cam_id not in self.trackers:
             self.trackers[cam_id] = Tracker()
-            from person_management.employee_session_manager import EmployeeSessionManager
-            self.session_managers[cam_id] = EmployeeSessionManager()
             self.unrecognized_tracks[cam_id] = {}
             
         tracker = self.trackers[cam_id]
-        session_manager = self.session_managers[cam_id]
         prev_unreg_tracks = self.unrecognized_tracks[cam_id]
 
         # 1. Detection - get both persons and phone detections
@@ -155,29 +153,30 @@ class MonitoringService:
         # 3. Update active sessions and unrecognized tracks
         current_track_ids = {t.track_id for t in tracks}
         
-        # Mark active sessions that are not in the current frame as "lost"
-        for session in session_manager.sessions.values():
-            if session.status == "tracking" and session.track_id not in current_track_ids:
-                session.status = "lost"
-                session.prev_seen = session.last_seen
-                print("----------------------")
-                print("Track Lost")
-                print(f"Track {session.track_id}")
-                print("Searching Lost Registry")
-                print("----------------------")
-                logger.info("Track Lost - Track ID %d, searching lost registry", session.track_id)
+        # Mark visible tracks for this camera that are not in the current frame as lost
+        for session in list(self.global_session_manager.sessions.values()):
+            if session.status != "exited" and cam_id in session.visible_cameras:
+                track_state = session.visible_cameras[cam_id]
+                if track_state.track_id not in current_track_ids:
+                    # Mark track as lost on this camera
+                    self.global_session_manager.handle_lost_track(cam_id, track_state.track_id, ts)
+                    print("----------------------")
+                    print("Track Lost")
+                    print(f"Track {track_state.track_id}")
+                    print("Searching Lost Registry")
+                    print("----------------------")
+                    logger.info("Track Lost - Track ID %d, searching lost registry", track_state.track_id)
 
         active_unrecognized_tracks = {}
 
         # 4. Map track lifecycle and try ReID / Face recognition
         for trk in tracks:
-            session = session_manager.get_session_by_track_id(trk.track_id)
+            session = self.global_session_manager.get_session_by_track(cam_id, trk.track_id)
             if session is not None:
                 # Update identified employee session
-                session_manager.update_session(session, trk.bbox, ts)
-                session_manager.update_metrics(session, phone_dets)
+                self.global_session_manager.update_track(session, cam_id, trk.track_id, trk.bbox, ts, phone_dets)
             else:
-                # This track is not bound to a session. Check if it's in our previous unrecognized list
+                # Check if this track is in our previous unrecognized list
                 prev_unreg = prev_unreg_tracks.get(trk.track_id)
                 if prev_unreg is None:
                     # New Track! Try ReID recovery against lost sessions
@@ -185,17 +184,16 @@ class MonitoringService:
                     
                     best_reid_score = -1.0
                     best_session = None
-                    best_session_dist = 0.0
 
                     p_cx = (trk.bbox[0] + trk.bbox[2]) / 2.0
                     p_cy = (trk.bbox[1] + trk.bbox[3]) / 2.0
 
                     if recomputed_hist is not None:
-                        for s in session_manager.sessions.values():
+                        for s in self.global_session_manager.sessions.values():
                             if s.status == "lost" and getattr(s, "reid_hist", None) is not None:
                                 if ts - s.last_seen <= timedelta(seconds=30):
-                                    other_cx = (s.bbox[0] + s.bbox[2]) / 2.0
-                                    other_cy = (s.bbox[1] + s.bbox[3]) / 2.0
+                                    other_cx = (s.current_bbox[0] + s.current_bbox[2]) / 2.0
+                                    other_cy = (s.current_bbox[1] + s.current_bbox[3]) / 2.0
                                     dist = np.sqrt((p_cx - other_cx)**2 + (p_cy - other_cy)**2)
 
                                     if dist < 400.0:
@@ -203,16 +201,15 @@ class MonitoringService:
                                         if score > best_reid_score:
                                             best_reid_score = score
                                             best_session = s
-                                            best_session_dist = dist
 
                     if best_session is not None and best_reid_score >= 0.85:
-                        old_track_id = best_session.track_id
-                        # Reconnect track to this session
-                        best_session.track_id = trk.track_id
-                        best_session.bbox = trk.bbox
-                        best_session.last_seen = ts
+                        old_track_id = best_session.current_track_id
+                        # Reconnect track to this session globally
+                        self.global_session_manager.bind_camera_track(
+                            best_session, cam_id, trk.track_id, trk.bbox, ts, recomputed_hist
+                        )
                         best_session.status = "tracking"
-                        best_session.logged_left = False # Reset flag in case it was set
+                        best_session.logged_left = False
                         
                         print("----------------------")
                         print("Track Changed")
@@ -273,26 +270,24 @@ class MonitoringService:
                         utrk["last_recognition_attempt"] = ts
                         face_res = self.recognizer.recognize_crop(crop, frame=frame)
                         if face_res.get("matched"):
-                            # Face recognized! Create session and lock identity
+                            # Face recognized!
                             emp_id = face_res["employee_id"]
                             emp_name = face_res["employee_name"]
                             confidence = face_res["confidence"]
-                            session_id = f"SESS_{emp_id}_{ts.strftime('%Y%m%d_%H%M%S')}"
-
                             rehist = self._compute_appearance_histogram(frame, utrk["bbox"])
 
-                            session = session_manager.create_session(
-                                session_id=session_id,
+                            session = self.global_session_manager.create_session(
                                 employee_id=emp_id,
                                 employee_name=emp_name,
-                                track_id=uid,
                                 camera_id=cam_id,
+                                track_id=uid,
                                 bbox=utrk["bbox"],
                                 timestamp=ts,
                                 confidence=confidence,
                                 reid_hist=rehist
                             )
-                            # Mark as recognized
+                            # Store the custom reid_hist on the session attribute for subsequent matches
+                            session.reid_hist = rehist
                             utrk["recognized"] = True
 
                             # Trigger session engine logging
@@ -328,59 +323,73 @@ class MonitoringService:
             if not utrk.get("recognized", False)
         }
 
-        # 6. Clean up lost sessions that exceed the 30-second lost timeout
-        for sid in list(session_manager.sessions.keys()):
-            session = session_manager.sessions[sid]
-            if session.status == "lost":
-                if ts - session.last_seen > session_manager.lost_timeout:
-                    if not getattr(session, "logged_left", False):
-                        session.logged_left = True
-                        duration_str = "0s"
-                        if session.first_seen is not None:
-                            duration_sec = (session.last_seen - session.first_seen).total_seconds()
-                            m, s = divmod(int(duration_sec), 60)
-                            h, m = divmod(m, 60)
-                            duration_str = f"{h}h {m}m {s}s"
-                        print("----------------------")
-                        print("Employee Session Ended")
-                        print(f"Employee ID: {session.employee_id}")
-                        print(f"Employee Name: {session.employee_name}")
-                        print(f"Production End Time: {session.last_seen:%Y-%m-%d %H:%M:%S}")
-                        print(f"Working Duration: {duration_str}")
-                        print("----------------------")
-                        logger.info("Employee Left - %s | Duration: %s", session.employee_name, duration_str)
-                    
-                    # Mark as exited and remove
-                    session.status = "exited"
-                    del session_manager.sessions[sid]
+        # 6. Clean up lost sessions that exceed the lost timeout
+        exited_list = self.global_session_manager.process_timeouts(ts)
+        for session in exited_list:
+            duration_sec = session.working_duration
+            m, s = divmod(int(duration_sec), 60)
+            h, m = divmod(m, 60)
+            duration_str = f"{h}h {m}m {s}s"
+            print("----------------------")
+            print("Employee Session Ended")
+            print(f"Employee ID: {session.employee_id}")
+            print(f"Employee Name: {session.employee_name}")
+            print(f"Production End Time: {session.last_seen:%Y-%m-%d %H:%M:%S}")
+            print(f"Working Duration: {duration_str}")
+            print("----------------------")
+            logger.info("Employee Left - %s | Duration: %s", session.employee_name, duration_str)
 
         # 7. Visual Render
         fps = self.camera_manager.get_fps(cam_id)
-        active_sessions = [s for s in session_manager.sessions.values() if s.status != "exited"]
+        
+        # Build Camera Session Projections
+        class LocalSessionProjection:
+            def __init__(self, gs, camera_id):
+                state = gs.visible_cameras[camera_id]
+                self.session_id = gs.session_id
+                self.employee_id = gs.employee_id
+                self.employee_name = gs.employee_name
+                self.track_id = state.track_id
+                self.bbox = state.bbox
+                self.last_seen = state.last_seen
+                self.first_seen = gs.first_seen
+                self.status = gs.status
+                self.phone_use_detected = state.phone_use_detected
+                self.phone_use_duration = gs.phone_use_duration
+                self.productivity_score = gs.productivity_score
+                self.recognition_confidence = gs.recognition_confidence
+
+        active_projections = []
+        for s in self.global_session_manager.sessions.values():
+            if s.status != "exited" and cam_id in s.visible_cameras:
+                active_projections.append(LocalSessionProjection(s, cam_id))
+                
         unreg_list = list(self.unrecognized_tracks[cam_id].values())
         
         annotated = self.renderer.draw(
             frame=frame,
-            sessions=active_sessions,
+            sessions=active_projections,
             unrecognized_tracks=unreg_list,
             fps=fps,
         )
 
-        # 8. JSON output logging (Disabled temporarily)
-        # self._write_json(cam_id, ts, active_sessions, unreg_list)
-
-        # Print frame-by-frame debug logs for active recognized employees
-        for s in active_sessions:
-            if s.status == "tracking":
+        # Print frame-by-frame debug logs for active recognized employees on this camera
+        for proj in active_projections:
+            if proj.status == "tracking":
+                key = (proj.session_id, cam_id)
+                prev_bbox = self.prev_bboxes.get(key, proj.bbox)
+                
                 print("----------------------")
                 print(f"Frame Number: {self.frame_counter}")
-                print(f"Employee ID: {s.employee_id}")
-                print(f"Track ID: {s.track_id}")
-                print(f"Current Bounding Box: {s.bbox}")
-                print(f"Previous Bounding Box: {s.prev_bbox if s.prev_bbox is not None else s.bbox}")
+                print(f"Employee ID: {proj.employee_id}")
+                print(f"Track ID: {proj.track_id}")
+                print(f"Current Bounding Box: {proj.bbox}")
+                print(f"Previous Bounding Box: {prev_bbox}")
                 print("----------------------")
+                
+                self.prev_bboxes[key] = proj.bbox
 
-        return annotated, active_sessions
+        return annotated, active_projections
 
     def run(self):
         """Start the CCTV monitoring loop."""

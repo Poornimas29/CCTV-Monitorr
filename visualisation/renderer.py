@@ -91,6 +91,7 @@ class Renderer:
                 f"ID: {s.employee_id} | Session: {s.session_id}",
                 f"Track: {s.track_id} | Match: {getattr(s, 'recognition_confidence', 0.0):.1f}%",
                 f"Prod Timer: {session_time}",
+                f"Start Time: {s.first_seen.strftime('%Y-%m-%d %H:%M:%S')}",
                 f"Prod Score: {s.productivity_score:.1f}%"
             ]
             if s.phone_use_detected:
