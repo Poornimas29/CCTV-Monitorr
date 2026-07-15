@@ -193,23 +193,37 @@ def main() -> None:
     flash_text: str = ""
     flash_expiry: float = 0.0
 
+    last_processed_timestamps = {}
+    annotated_frames = {}
+
     try:
         # Loop interval derived from target FPS
         wait_time_ms = max(1, int(1000 / TARGET_FPS))
 
         while True:
-            # ── Gather current state from all cameras ─────────────────────────
-            frames = {cam_id: manager.get_latest_frame(cam_id) for cam_id in camera_ids}
             connected_map = {cam_id: manager.is_connected(cam_id) for cam_id in camera_ids}
             fps_map = {cam_id: manager.get_fps(cam_id) for cam_id in camera_ids}
+            frames = {}
 
             for cam_id in camera_ids:
-                frame = frames.get(cam_id)
-                if frame is not None and connected_map.get(cam_id, False):
-                    annotated, person_states = monitoring_service.process_camera_frame(
-                        cam_id, frame, datetime.datetime.now()
-                    )
-                    frames[cam_id] = annotated
+                latest_data = manager.get_latest_frame_with_timestamp(cam_id)
+                if latest_data is not None:
+                    frame, ts = latest_data
+                    if connected_map.get(cam_id, False):
+                        last_ts = last_processed_timestamps.get(cam_id)
+                        if ts != last_ts:
+                            annotated, person_states = monitoring_service.process_camera_frame(
+                                cam_id, frame, ts
+                            )
+                            annotated_frames[cam_id] = annotated
+                            last_processed_timestamps[cam_id] = ts
+                            frames[cam_id] = annotated
+                        else:
+                            frames[cam_id] = annotated_frames.get(cam_id, frame)
+                    else:
+                        frames[cam_id] = frame
+                else:
+                    frames[cam_id] = None
 
             # ── Build and display the single dashboard frame ──────────────────
             dashboard = renderer.build_dashboard(

@@ -251,71 +251,89 @@ class MonitoringService:
             px2, py2 = min(w, px2), min(h, py2)
 
             crop = frame[py1:py2, px1:px2]
-            utrk["face_bbox"] = None # Reset face bbox for this frame
+            crop_w = px2 - px1
+            crop_h = py2 - py1
 
-            if crop.size > 0:
-                detections = self.recognizer._detect_faces(crop)
-                if detections:
-                    det = detections[0]
-                    fx, fy, fw, fh = det["bbox"]
+            # Check if retry interval has elapsed (2 seconds)
+            should_attempt = False
+            last_attempt = utrk.get("last_recognition_attempt")
+            if last_attempt is None or (ts - last_attempt).total_seconds() >= 2.0:
+                should_attempt = True
+
+            if should_attempt and crop.size > 0 and crop_w > 0 and crop_h > 0:
+                utrk["last_recognition_attempt"] = ts
+                face_res = self.recognizer.recognize_crop(crop, frame=frame)
+                
+                if face_res.get("bbox") is not None:
+                    fx, fy, fw, fh = face_res["bbox"]
+                    rx1, ry1 = fx / crop_w, fy / crop_h
+                    rx2, ry2 = (fx + fw) / crop_w, (fy + fh) / crop_h
+                    utrk["relative_face_bbox"] = (rx1, ry1, rx2, ry2)
                     utrk["face_bbox"] = [px1 + fx, py1 + fy, px1 + fx + fw, py1 + fy + fh]
+                else:
+                    utrk["face_bbox"] = None
+                    utrk["relative_face_bbox"] = None
 
-                    # Check if retry interval has elapsed (2 seconds)
-                    should_attempt = False
-                    last_attempt = utrk["last_recognition_attempt"]
-                    if last_attempt is None or (ts - last_attempt).total_seconds() >= 2.0:
-                        should_attempt = True
+                if face_res.get("matched"):
+                    # Face recognized!
+                    emp_id = face_res["employee_id"]
+                    emp_name = face_res["employee_name"]
+                    confidence = face_res["confidence"]
+                    rehist = self._compute_appearance_histogram(frame, utrk["bbox"])
 
-                    if should_attempt:
-                        utrk["last_recognition_attempt"] = ts
-                        face_res = self.recognizer.recognize_crop(crop, frame=frame)
-                        if face_res.get("matched"):
-                            # Face recognized!
-                            emp_id = face_res["employee_id"]
-                            emp_name = face_res["employee_name"]
-                            confidence = face_res["confidence"]
-                            rehist = self._compute_appearance_histogram(frame, utrk["bbox"])
+                    session = self.global_session_manager.create_session(
+                        employee_id=emp_id,
+                        employee_name=emp_name,
+                        camera_id=cam_id,
+                        track_id=uid,
+                        bbox=utrk["bbox"],
+                        timestamp=ts,
+                        confidence=confidence,
+                        reid_hist=rehist
+                    )
+                    # Store the custom reid_hist on the session attribute for subsequent matches
+                    session.reid_hist = rehist
+                    utrk["recognized"] = True
 
-                            session = self.global_session_manager.create_session(
-                                employee_id=emp_id,
-                                employee_name=emp_name,
-                                camera_id=cam_id,
-                                track_id=uid,
-                                bbox=utrk["bbox"],
-                                timestamp=ts,
-                                confidence=confidence,
-                                reid_hist=rehist
-                            )
-                            # Store the custom reid_hist on the session attribute for subsequent matches
-                            session.reid_hist = rehist
-                            utrk["recognized"] = True
-
-                            # Trigger session engine logging
-                            self.session_engine.process_recognition(
-                                employee_id=emp_id,
-                                employee_name=emp_name,
-                                confidence=confidence,
-                                timestamp=ts
-                            )
+                    # Trigger session engine logging
+                    self.session_engine.process_recognition(
+                        employee_id=emp_id,
+                        employee_name=emp_name,
+                        confidence=confidence,
+                        timestamp=ts
+                    )
+                    print("----------------------")
+                    print("Employee Session Started")
+                    print(f"Employee ID: {emp_id}")
+                    print(f"Employee Name: {emp_name}")
+                    print(f"Track ID: {uid}")
+                    print(f"Recognition Confidence: {confidence:.1f}%")
+                    print(f"Recognition Time: {ts:%Y-%m-%d %H:%M:%S}")
+                    print(f"Production Start Time: {ts:%Y-%m-%d %H:%M:%S}")
+                    print("----------------------")
+                    logger.info("Face Recognized - %s | Confidence: %.1f%% | Identity Locked", emp_name, confidence)
+                else:
+                    if face_res.get("status") != "no_face":
+                        if not utrk.get("logged_unknown", False):
+                            utrk["logged_unknown"] = True
                             print("----------------------")
-                            print("Employee Session Started")
-                            print(f"Employee ID: {emp_id}")
-                            print(f"Employee Name: {emp_name}")
+                            print("Unknown face detected")
+                            print(f"Camera: {cam_id}")
                             print(f"Track ID: {uid}")
-                            print(f"Recognition Confidence: {confidence:.1f}%")
-                            print(f"Recognition Time: {ts:%Y-%m-%d %H:%M:%S}")
-                            print(f"Production Start Time: {ts:%Y-%m-%d %H:%M:%S}")
+                            print(f"Time: {ts:%Y-%m-%d %H:%M:%S}")
                             print("----------------------")
-                            logger.info("Face Recognized - %s | Confidence: %.1f%% | Identity Locked", emp_name, confidence)
-                        else:
-                            if not utrk.get("logged_unknown", False):
-                                utrk["logged_unknown"] = True
-                                print("----------------------")
-                                print("Unknown face detected")
-                                print(f"Camera: {cam_id}")
-                                print(f"Track ID: {uid}")
-                                print(f"Time: {ts:%Y-%m-%d %H:%M:%S}")
-                                print("----------------------")
+            else:
+                # If not attempting face recognition this frame, estimate face_bbox from last detection (if any)
+                if utrk.get("relative_face_bbox") is not None and crop_w > 0 and crop_h > 0:
+                    rx1, ry1, rx2, ry2 = utrk["relative_face_bbox"]
+                    utrk["face_bbox"] = [
+                        int(px1 + rx1 * crop_w),
+                        int(py1 + ry1 * crop_h),
+                        int(px1 + rx2 * crop_w),
+                        int(py1 + ry2 * crop_h)
+                    ]
+                else:
+                    utrk["face_bbox"] = None
 
         # Store unrecognized tracks
         self.unrecognized_tracks[cam_id] = {
@@ -358,6 +376,7 @@ class MonitoringService:
                 self.phone_use_duration = gs.phone_use_duration
                 self.productivity_score = gs.productivity_score
                 self.recognition_confidence = gs.recognition_confidence
+                self.is_recognized = (gs.status == "tracking") and (gs.employee_id is not None)
 
         active_projections = []
         for s in self.global_session_manager.sessions.values():
@@ -375,19 +394,33 @@ class MonitoringService:
 
         # Print frame-by-frame debug logs for active recognized employees on this camera
         for proj in active_projections:
-            if proj.status == "tracking":
-                key = (proj.session_id, cam_id)
-                prev_bbox = self.prev_bboxes.get(key, proj.bbox)
-                
-                print("----------------------")
-                print(f"Frame Number: {self.frame_counter}")
-                print(f"Employee ID: {proj.employee_id}")
-                print(f"Track ID: {proj.track_id}")
-                print(f"Current Bounding Box: {proj.bbox}")
-                print(f"Previous Bounding Box: {prev_bbox}")
-                print("----------------------")
-                
-                self.prev_bboxes[key] = proj.bbox
+            key = (proj.session_id, cam_id)
+            prev_bbox = self.prev_bboxes.get(key, proj.bbox)
+            drawing_green_box = "Yes" if proj.is_recognized and proj.employee_id is not None else "No"
+            
+            print("----------------------", flush=True)
+            print(f"Frame Number: {self.frame_counter}", flush=True)
+            print(f"Track ID: {proj.track_id}", flush=True)
+            print(f"Recognition Status: {proj.status}", flush=True)
+            print(f"Employee ID: {proj.employee_id}", flush=True)
+            print(f"Recognition Confidence: {proj.recognition_confidence:.1f}%", flush=True)
+            print(f"Bounding Box: {proj.bbox}", flush=True)
+            print(f"Drawing Green Box = {drawing_green_box}", flush=True)
+            print("----------------------", flush=True)
+            
+            self.prev_bboxes[key] = proj.bbox
+
+        # Print frame-by-frame debug logs for unrecognized tracks on this camera
+        for utrk in unreg_list:
+            print("----------------------", flush=True)
+            print(f"Frame Number: {self.frame_counter}", flush=True)
+            print(f"Track ID: {utrk['track_id']}", flush=True)
+            print("Recognition Status: unrecognized", flush=True)
+            print("Employee ID: None", flush=True)
+            print("Recognition Confidence: 0.0%", flush=True)
+            print(f"Bounding Box: {utrk['bbox']}", flush=True)
+            print("Drawing Green Box = No", flush=True)
+            print("----------------------", flush=True)
 
         return annotated, active_projections
 

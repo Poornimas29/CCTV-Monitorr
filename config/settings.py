@@ -38,12 +38,12 @@ CAMERAS: list[dict] = [
         "channel": 6,
         "enabled": True
     },
-    {
-        "id": "CAM003",
-        "name": "Packing Area",
-        "channel": 4,
-        "enabled": True
-    },
+    # {
+    #     "id": "CAM003",
+    #     "name": "Packing Area",
+    #     "channel": 4,
+    #     "enabled": True
+    # },
      {
         "id": "CAM004",
         "name": "Hall Area",

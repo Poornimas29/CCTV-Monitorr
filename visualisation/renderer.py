@@ -71,7 +71,9 @@ class Renderer:
 
         # 2. Draw active recognized employee sessions (ONLY body box, no face box)
         for s in sessions:
-            if s.status != "tracking":
+            # Drawing logic only checks for: s.is_recognized == True and employee_id is not None
+            is_recognized = getattr(s, "is_recognized", False)
+            if not is_recognized or s.employee_id is None:
                 continue
                 
             x1, y1, x2, y2 = s.bbox

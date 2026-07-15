@@ -210,6 +210,13 @@ class CameraManager:
             return None
         return stream_mgr.get_latest_frame()
 
+    def get_latest_frame_with_timestamp(self, cam_id: str) -> Optional[Tuple[np.ndarray, datetime]]:
+        """Return the most recent frame and timestamp for *cam_id* or ``None`` if unavailable."""
+        stream_mgr = self.streams.get(cam_id)
+        if not stream_mgr:
+            return None
+        return stream_mgr.frame_buffer.latest()
+
     def is_connected(self, cam_id: str) -> bool:
         """Return ``True`` if *cam_id* is currently delivering frames."""
         stream_mgr = self.streams.get(cam_id)

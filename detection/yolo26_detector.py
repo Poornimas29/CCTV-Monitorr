@@ -39,22 +39,43 @@ class YOLO26Detector:
             cls._instance = cls(model_path)
         return cls._instance
 
-    def __init__(self, model_path: str = ""):
+    def __init__(self, model_path: str = "") -> None:
         if getattr(self, "_initialized", False):
             return
 
         import ultralytics
         from ultralytics import YOLO
+        import torch
+        import openvino as ov
 
         self.model_path = Path(model_path) if model_path else None
-        self.device = "cpu"
+        
+        # Detect best available device for YOLO
+        core = ov.Core()
+        if torch.cuda.is_available():
+            self.device = "cuda"
+        elif "GPU" in core.available_devices:
+            self.device = "intel:gpu"
+        else:
+            self.device = "cpu"
 
-        # Load custom model if provided, otherwise default to yolov8n.pt
-        model_name = str(self.model_path) if self.model_path else "yolov8n.pt"
+        # Load custom model if provided, otherwise default to yolo26n.pt
+        model_name = str(self.model_path) if self.model_path else "yolo26n.pt"
+
+        # If targeting OpenVINO GPU, ensure model is exported to OpenVINO format
+        if self.device == "intel:gpu":
+            base_model_name = model_name
+            openvino_dir = Path(model_name).stem + "_openvino_model"
+            if not Path(openvino_dir).exists():
+                logger.info("Exporting YOLO model to OpenVINO format for GPU acceleration...")
+                temp_model = YOLO(base_model_name)
+                temp_model.export(format="openvino", imgsz=320)
+            model_name = openvino_dir
 
         try:
-            self.model = YOLO(model_name)
-            self.model.to(self.device)
+            self.model = YOLO(model_name, task="detect")
+            if self.device in ["cpu", "cuda"]:
+                self.model.to(self.device)
         except Exception as exc:
             raise RuntimeError(f"Failed to load YOLO model '{model_name}': {exc}")
 
@@ -63,15 +84,17 @@ class YOLO26Detector:
             "\n--------------------------------\n"
             "Detection Engine\n\n"
             f"Model File: {model_name}\n"
-            "Framework: PyTorch (Ultralytics API)\n"
+            "Framework: OpenVINO (Ultralytics API)" if self.device == "intel:gpu" else "Framework: PyTorch (Ultralytics API)",
             f"Ultralytics Version: {ultralytics.__version__}\n"
             f"Device: {self.device}\n"
             "Detection Classes: [0, 67]\n"
             "Tracking: Class 0 (Person) Only passed to ByteTrack\n"
             "--------------------------------"
         )
-        print(report, flush=True)
-        logger.info(report)
+        # Format list to string if report is a tuple
+        report_str = "\n".join(report) if isinstance(report, tuple) else report
+        print(report_str, flush=True)
+        logger.info(report_str)
 
         self._initialized = True
 
@@ -80,8 +103,8 @@ class YOLO26Detector:
         if frame is None or frame.size == 0:
             return []
 
-        # Run inference using ultralytics YOLO model on CPU
-        results = self.model(frame, conf=0.4, verbose=False)[0]
+        # Run inference using ultralytics YOLO model on selected device (CPU/GPU/CUDA) with imgsz=320
+        results = self.model(frame, conf=0.4, verbose=False, imgsz=320, device=self.device)[0]
         detections: List[Detection] = []
 
         if results.boxes is not None:

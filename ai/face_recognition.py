@@ -65,11 +65,25 @@ class FaceRecognitionEngine:
         """Initialize the InsightFace application. Fail if unavailable."""
         try:
             from insightface.app import FaceAnalysis
+            import onnxruntime as ort
 
-            app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
-            app.prepare(ctx_id=0, det_size=(640, 640))
+            providers = ort.get_available_providers()
+            logger.info("Available ONNX Runtime providers: %s", providers)
+            selected_providers = []
+            if "CUDAExecutionProvider" in providers:
+                selected_providers.append("CUDAExecutionProvider")
+            if "DmlExecutionProvider" in providers:
+                selected_providers.append("DmlExecutionProvider")
+            selected_providers.append("CPUExecutionProvider")
+
+            logger.info("InsightFace initializing with providers: %s", selected_providers)
+            app = FaceAnalysis(name="buffalo_l", providers=selected_providers)
+            # Use GPU ctx_id=0 if GPU provider (CUDA/Dml) is enabled, else -1 for CPU fallback
+            has_gpu = "CUDAExecutionProvider" in selected_providers or "DmlExecutionProvider" in selected_providers
+            ctx_id = 0 if has_gpu else -1
+            app.prepare(ctx_id=ctx_id, det_size=(640, 640))
             self._insightface_app = app
-            logger.info("InsightFace backend loaded successfully")
+            logger.info("InsightFace backend loaded successfully using device context %d", ctx_id)
         except Exception as exc:
             raise RuntimeError(f"InsightFace backend is required but failed to load: {exc}")
 
