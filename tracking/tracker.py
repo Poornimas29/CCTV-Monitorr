@@ -10,8 +10,8 @@ from typing import List
 import numpy as np
 
 from .byte_tracker import ByteTracker
-
 from detection.yolo26_detector import Detection
+import config.settings as settings
 
 @dataclass
 class Track:
@@ -37,7 +37,11 @@ class Tracker:
 
         Returns a list of :class:`Track` objects with persistent ``track_id``.
         """
-        person_dets = [d for d in detections if d.class_id == 0]
+        # Filter for person detections that meet the configurable confidence threshold
+        person_dets = [
+            d for d in detections 
+            if d.class_id == 0 and d.confidence >= settings.CONF_PERSON
+        ]
         
         if not person_dets:
             dets = np.empty((0, 5), dtype=np.float32)
@@ -53,3 +57,4 @@ class Tracker:
             bbox = [int(v) for v in t.tlbr]
             result.append(Track(track_id=int(t.track_id), bbox=bbox, confidence=float(t.score)))
         return result
+

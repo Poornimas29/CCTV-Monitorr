@@ -12,6 +12,8 @@ from session.global_session_manager import GlobalSessionManager, GlobalSession, 
 
 class TestGlobalSessionManager(unittest.TestCase):
     def setUp(self) -> None:
+        import config.settings as settings
+        settings.PHONE_USAGE_CONFIRM_SECONDS = 0.0
         self.manager = GlobalSessionManager(lost_timeout_seconds=30)
         self.base_time = datetime(2026, 7, 14, 18, 0, 0)
 
@@ -108,7 +110,17 @@ class TestGlobalSessionManager(unittest.TestCase):
         mock_phone = MagicMock()
         mock_phone.bbox = [140, 140, 160, 160]
 
-        # Update track with phone use
+        # Update track at base_time to start phone overlap interval
+        self.manager.update_track(
+            session=session,
+            camera_id="CAM001",
+            track_id=1,
+            bbox=[100, 100, 200, 200],
+            timestamp=self.base_time,
+            phone_dets=[mock_phone]
+        )
+
+        # Update track with phone use at t=3s
         self.manager.update_track(
             session=session,
             camera_id="CAM001",

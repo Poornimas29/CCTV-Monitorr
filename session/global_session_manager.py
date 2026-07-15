@@ -6,8 +6,9 @@ decoupled from raw camera-specific track IDs.
 from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 import numpy as np
+import config.settings as settings
 
 @dataclass
 class CameraTrackState:
@@ -16,6 +17,8 @@ class CameraTrackState:
     bbox: List[int]
     last_seen: datetime
     phone_use_detected: bool = False
+    pose_state: Optional[Dict[str, Any]] = None
+
 
 @dataclass
 class GlobalSession:
@@ -26,7 +29,8 @@ class GlobalSession:
     status: str
     first_seen: datetime
     last_seen: datetime
-    reid_hist: Optional[np.ndarray] = None
+    reid_features: Optional[np.ndarray] = None
+    reid_hist: Optional[np.ndarray] = None  # Backward compatibility fallback
     visible_cameras: Dict[str, CameraTrackState] = field(default_factory=dict)
     current_track_id: int = -1
     current_bbox: List[int] = field(default_factory=list)
@@ -34,6 +38,14 @@ class GlobalSession:
     productivity_score: float = 100.0
     recognition_confidence: float = 0.0
     logged_left: bool = False
+    
+    # Pose estimation states
+    pose_state: Optional[Dict[str, Any]] = None
+
+    # Phone usage confirmation tracking
+    phone_use_start: Optional[datetime] = None
+    phone_confirmed_use_active: bool = False
+    phone_use_history: List[Dict[str, Any]] = field(default_factory=list)
 
     @property
     def working_duration(self) -> float:
@@ -67,14 +79,18 @@ class GlobalSessionManager:
         bbox: List[int],
         timestamp: datetime,
         confidence: float,
+        reid_features: Optional[np.ndarray] = None,
         reid_hist: Optional[np.ndarray] = None
     ) -> GlobalSession:
         """Create a new global session or reactivate/re-bind an existing non-exited session."""
+        if reid_features is None and reid_hist is not None:
+            reid_features = reid_hist
+
         # Check for an existing non-exited session for this employee to prevent duplicates
         for session in self.sessions.values():
             if session.employee_id == employee_id and session.status != "exited":
                 session.status = "tracking"
-                self.bind_camera_track(session, camera_id, track_id, bbox, timestamp, reid_hist)
+                self.bind_camera_track(session, camera_id, track_id, bbox, timestamp, reid_features)
                 return session
 
         # Create a new session if none exists
@@ -86,7 +102,8 @@ class GlobalSessionManager:
             status="tracking",
             first_seen=timestamp,
             last_seen=timestamp,
-            reid_hist=reid_hist,
+            reid_features=reid_features,
+            reid_hist=reid_features if reid_features is not None and reid_features.ndim > 1 else None,
             visible_cameras={camera_id: CameraTrackState(track_id, bbox, timestamp)},
             current_track_id=track_id,
             current_bbox=list(bbox),
@@ -105,13 +122,15 @@ class GlobalSessionManager:
         track_id: int,
         bbox: List[int],
         timestamp: datetime,
-        phone_dets: List[Any]
+        phone_dets: List[Any],
+        pose_state: Optional[Dict[str, Any]] = None
     ) -> None:
         """Update an existing session's tracking state on a camera, and update metrics."""
         session.last_seen = timestamp
         session.status = "tracking"
         session.current_track_id = track_id
         session.current_bbox = list(bbox)
+        session.pose_state = pose_state
 
         # Ensure camera track state exists
         if camera_id not in session.visible_cameras:
@@ -121,24 +140,76 @@ class GlobalSessionManager:
         prev_seen = cam_state.last_seen
         cam_state.bbox = list(bbox)
         cam_state.last_seen = timestamp
+        cam_state.pose_state = pose_state
 
-        # Check for phone use overlap on this camera
+        # ── Phone-Hand Proximity Check ──────────────────────────────────
         phone_used = False
         px1, py1, px2, py2 = bbox
+        pw = px2 - px1
+        ph = py2 - py1
+
+        # Use dynamic threshold for proximity: 15% of the person's bounding box size
+        proximity_threshold = 0.15 * max(pw, ph)
+
         for phone in phone_dets:
             ph_x1, ph_y1, ph_x2, ph_y2 = phone.bbox
             ph_cx = (ph_x1 + ph_x2) / 2.0
             ph_cy = (ph_y1 + ph_y2) / 2.0
+            
+            # 1. Spatial overlap: center of phone must be inside the person's bounding box
             if px1 <= ph_cx <= px2 and py1 <= ph_cy <= py2:
-                phone_used = True
-                break
+                # 2. Hand proximity: check distance to left/right hands from MediaPipe Pose
+                has_hand_proximity = False
+                if pose_state and pose_state.get("hands"):
+                    hands = pose_state["hands"]
+                    left_hand = hands.get("left")
+                    right_hand = hands.get("right")
+                    
+                    if left_hand:
+                        lh_dist = np.sqrt((ph_cx - left_hand[0])**2 + (ph_cy - left_hand[1])**2)
+                        if lh_dist < proximity_threshold:
+                            has_hand_proximity = True
+                    if right_hand:
+                        rh_dist = np.sqrt((ph_cx - right_hand[0])**2 + (ph_cy - right_hand[1])**2)
+                        if rh_dist < proximity_threshold:
+                            has_hand_proximity = True
+                
+                # If we have pose landmarks, enforce proximity. If not, fallback to spatial overlap.
+                if pose_state and pose_state.get("landmarks"):
+                    if has_hand_proximity:
+                        phone_used = True
+                        break
+                else:
+                    phone_used = True
+                    break
 
         cam_state.phone_use_detected = phone_used
 
-        if phone_used and prev_seen is not None:
-            dt = (timestamp - prev_seen).total_seconds()
-            if 0.0 < dt < 5.0:  # Ignore anomalies
-                session.phone_use_duration += dt
+        # ── Timer & Confirmation logic ──────────────────────────────────
+        if phone_used:
+            if session.phone_use_start is None:
+                session.phone_use_start = timestamp
+            else:
+                overlap_time = (timestamp - session.phone_use_start).total_seconds()
+                if overlap_time >= settings.PHONE_USAGE_CONFIRM_SECONDS:
+                    # Confirmed phone usage active! Accumulate duration
+                    if prev_seen is not None:
+                        dt = (timestamp - prev_seen).total_seconds()
+                        if 0.0 < dt < 5.0:  # Ignore anomalies
+                            session.phone_use_duration += dt
+                    session.phone_confirmed_use_active = True
+        else:
+            # Overlap ended. If usage was active, close the interval
+            if session.phone_use_start is not None:
+                duration = (timestamp - session.phone_use_start).total_seconds()
+                if duration >= settings.PHONE_USAGE_CONFIRM_SECONDS:
+                    session.phone_use_history.append({
+                        "start": session.phone_use_start,
+                        "end": timestamp,
+                        "duration": duration
+                    })
+                session.phone_use_start = None
+                session.phone_confirmed_use_active = False
 
         # Update global productivity score
         total_duration = session.working_duration
@@ -155,14 +226,21 @@ class GlobalSessionManager:
         track_id: int,
         bbox: List[int],
         timestamp: datetime,
+        reid_features: Optional[np.ndarray] = None,
         reid_hist: Optional[np.ndarray] = None
     ) -> None:
         """Bind/reconnect a camera track ID to a global session."""
+        if reid_features is None and reid_hist is not None:
+            reid_features = reid_hist
+
         session.last_seen = timestamp
         session.current_track_id = track_id
         session.current_bbox = list(bbox)
-        if reid_hist is not None:
-            session.reid_hist = reid_hist
+        if reid_features is not None:
+            session.reid_features = reid_features
+            if reid_features.ndim > 1:
+                session.reid_hist = reid_features
+
 
         session.visible_cameras[camera_id] = CameraTrackState(
             track_id=track_id,
@@ -192,6 +270,19 @@ class GlobalSessionManager:
         for session in list(self.sessions.values()):
             if session.status == "lost":
                 if timestamp - session.last_seen > self.lost_timeout:
+                    # If phone usage was active during timeout, finalize it
+                    if session.phone_use_start is not None:
+                        duration = (session.last_seen - session.phone_use_start).total_seconds()
+                        if duration >= settings.PHONE_USAGE_CONFIRM_SECONDS:
+                            session.phone_use_history.append({
+                                "start": session.phone_use_start,
+                                "end": session.last_seen,
+                                "duration": duration
+                            })
+                        session.phone_use_start = None
+                        session.phone_confirmed_use_active = False
+                    
                     session.status = "exited"
                     exited.append(session)
         return exited
+

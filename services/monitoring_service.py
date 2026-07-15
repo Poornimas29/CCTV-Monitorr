@@ -18,7 +18,7 @@ import sys
 import logging
 import numpy as np
 from datetime import datetime, timedelta
-from typing import Optional, List
+from typing import Optional, List, Any
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +33,8 @@ from detection.yolo26_detector import YOLO26Detector
 from tracking.tracker import Tracker
 from person_management.person_manager import PersonManager
 from visualisation.renderer import Renderer
+from ai.pose_estimator import MediaPipePoseEstimator
+from ai.reid_engine import FastReIDEngine
 
 
 class MonitoringService:
@@ -54,6 +56,10 @@ class MonitoringService:
         self.detector = YOLO26Detector.instance()
         self.renderer = Renderer()
 
+        # Initialize MediaPipe Pose Estimator and FastReID Engine
+        self.pose_estimator = MediaPipePoseEstimator()
+        self.reid_engine = FastReIDEngine()
+
         # Initialize Employee and Face Recognition components
         from employee_management.employee_manager import EmployeeManager
         self.employee_manager = EmployeeManager(project_root=PROJECT_ROOT)
@@ -68,28 +74,6 @@ class MonitoringService:
 
         # Ensure output directory exists.
         os.makedirs(settings.OUTPUT_DIR, exist_ok=True)
-
-    def _compute_appearance_histogram(self, frame: np.ndarray, bbox: list) -> Optional[np.ndarray]:
-        h, w = frame.shape[:2]
-        x1, y1, x2, y2 = bbox
-        x1, y1 = max(0, int(x1)), max(0, int(y1))
-        x2, y2 = min(w, int(x2)), min(h, int(y2))
-        person_crop = frame[y1:y2, x1:x2]
-        if person_crop.size == 0:
-            return None
-            
-        ch, cw = person_crop.shape[:2]
-        # Focus on the torso (middle 60% vertically and 80% horizontally) to represent clothing
-        ty1, ty2 = int(ch * 0.2), int(ch * 0.8)
-        tx1, tx2 = int(cw * 0.1), int(cw * 0.9)
-        torso_crop = person_crop[ty1:ty2, tx1:tx2]
-        if torso_crop.size == 0:
-            return None
-            
-        hsv = cv2.cvtColor(torso_crop, cv2.COLOR_BGR2HSV)
-        hist = cv2.calcHist([hsv], [0, 1], None, [30, 32], [0, 180, 0, 256])
-        cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
-        return hist
 
     def _write_json(self, cam_id: str, ts: datetime, sessions: list, unrecognized_tracks: list):
         person_list = []
@@ -140,7 +124,7 @@ class MonitoringService:
         tracker = self.trackers[cam_id]
         prev_unreg_tracks = self.unrecognized_tracks[cam_id]
 
-        # 1. Detection - get both persons and phone detections
+        # 1. Detection - get detections (person, cell phone, uniform, cap)
         all_detections = self.detector.detect(frame)
         
         # Separate detections
@@ -150,7 +134,14 @@ class MonitoringService:
         # 2. Tracking - track persons persistently
         tracks = tracker.update(person_dets)
 
-        # 3. Update active sessions and unrecognized tracks
+        # 3. MediaPipe Pose estimation - Run ONLY for tracked persons
+        pose_states = {}
+        for trk in tracks:
+            p_state = self.pose_estimator.estimate_pose(frame, trk.bbox)
+            if p_state:
+                pose_states[trk.track_id] = p_state
+
+        # 4. Update active sessions and unrecognized tracks
         current_track_ids = {t.track_id for t in tracks}
         
         # Mark visible tracks for this camera that are not in the current frame as lost
@@ -169,57 +160,52 @@ class MonitoringService:
 
         active_unrecognized_tracks = {}
 
-        # 4. Map track lifecycle and try ReID / Face recognition
+        # 5. Map track lifecycle and try ReID / Face recognition
         for trk in tracks:
             session = self.global_session_manager.get_session_by_track(cam_id, trk.track_id)
             if session is not None:
-                # Update identified employee session
-                self.global_session_manager.update_track(session, cam_id, trk.track_id, trk.bbox, ts, phone_dets)
+                # Update identified employee session with pose state
+                self.global_session_manager.update_track(
+                    session, cam_id, trk.track_id, trk.bbox, ts, phone_dets, pose_states.get(trk.track_id)
+                )
             else:
                 # Check if this track is in our previous unrecognized list
                 prev_unreg = prev_unreg_tracks.get(trk.track_id)
                 if prev_unreg is None:
                     # New Track! Try ReID recovery against lost sessions
-                    recomputed_hist = self._compute_appearance_histogram(frame, trk.bbox)
+                    feat = self.reid_engine.extract_features(frame, trk.bbox)
                     
                     best_reid_score = -1.0
                     best_session = None
 
-                    p_cx = (trk.bbox[0] + trk.bbox[2]) / 2.0
-                    p_cy = (trk.bbox[1] + trk.bbox[3]) / 2.0
-
-                    if recomputed_hist is not None:
+                    if feat is not None:
                         for s in self.global_session_manager.sessions.values():
-                            if s.status == "lost" and getattr(s, "reid_hist", None) is not None:
-                                if ts - s.last_seen <= timedelta(seconds=30):
-                                    other_cx = (s.current_bbox[0] + s.current_bbox[2]) / 2.0
-                                    other_cy = (s.current_bbox[1] + s.current_bbox[3]) / 2.0
-                                    dist = np.sqrt((p_cx - other_cx)**2 + (p_cy - other_cy)**2)
+                            if s.status == "lost" and getattr(s, "reid_features", None) is not None:
+                                # Keep continuous timer if reconnected within lost timeout
+                                if ts - s.last_seen <= self.global_session_manager.lost_timeout:
+                                    score = self.reid_engine.compute_similarity(feat, s.reid_features)
+                                    if score > best_reid_score:
+                                        best_reid_score = score
+                                        best_session = s
 
-                                    if dist < 400.0:
-                                        score = cv2.compareHist(recomputed_hist, s.reid_hist, cv2.HISTCMP_CORREL)
-                                        if score > best_reid_score:
-                                            best_reid_score = score
-                                            best_session = s
-
-                    if best_session is not None and best_reid_score >= 0.85:
+                    if best_session is not None and best_reid_score >= settings.REID_SIMILARITY_THRESHOLD:
                         old_track_id = best_session.current_track_id
                         # Reconnect track to this session globally
                         self.global_session_manager.bind_camera_track(
-                            best_session, cam_id, trk.track_id, trk.bbox, ts, recomputed_hist
+                            best_session, cam_id, trk.track_id, trk.bbox, ts, feat
                         )
                         best_session.status = "tracking"
                         best_session.logged_left = False
                         
                         print("----------------------")
-                        print("Track Changed")
+                        print("Track Changed (FastReID)")
                         print(f"Employee ID: {best_session.employee_id}")
                         print(f"Old Track ID: {old_track_id}")
                         print(f"New Track ID: {trk.track_id}")
-                        print("Recovery Method: Torso ReID color histogram + spatial distance matching")
+                        print(f"Recovery Method: FastReID deep feature similarity (Score: {best_reid_score:.4f})")
                         print("----------------------")
                         logger.info(
-                            "[ReID] Reconnected Track ID %d to Employee Session %s (%s) - Score: %.4f",
+                            "[FastReID] Reconnected Track ID %d to Employee Session %s (%s) - Score: %.4f",
                             trk.track_id, best_session.session_id, best_session.employee_name, best_reid_score
                         )
                     else:
@@ -236,14 +222,16 @@ class MonitoringService:
                             "track_id": trk.track_id,
                             "bbox": trk.bbox,
                             "face_bbox": None,
-                            "last_recognition_attempt": None
+                            "last_recognition_attempt": None,
+                            "pose_state": pose_states.get(trk.track_id)
                         }
                 else:
-                    # Update existing unrecognized track bbox
+                    # Update existing unrecognized track bbox and pose
                     prev_unreg["bbox"] = trk.bbox
+                    prev_unreg["pose_state"] = pose_states.get(trk.track_id)
                     active_unrecognized_tracks[trk.track_id] = prev_unreg
 
-        # 5. Process face detection & recognition on unrecognized tracks
+        # 6. Process face detection & recognition on unrecognized tracks
         for uid, utrk in active_unrecognized_tracks.items():
             px1, py1, px2, py2 = utrk["bbox"]
             h, w = frame.shape[:2]
@@ -279,7 +267,9 @@ class MonitoringService:
                     emp_id = face_res["employee_id"]
                     emp_name = face_res["employee_name"]
                     confidence = face_res["confidence"]
-                    rehist = self._compute_appearance_histogram(frame, utrk["bbox"])
+                    
+                    # Extract ReID features for this employee session
+                    feat = self.reid_engine.extract_features(frame, utrk["bbox"])
 
                     session = self.global_session_manager.create_session(
                         employee_id=emp_id,
@@ -289,10 +279,8 @@ class MonitoringService:
                         bbox=utrk["bbox"],
                         timestamp=ts,
                         confidence=confidence,
-                        reid_hist=rehist
+                        reid_features=feat
                     )
-                    # Store the custom reid_hist on the session attribute for subsequent matches
-                    session.reid_hist = rehist
                     utrk["recognized"] = True
 
                     # Trigger session engine logging
@@ -323,7 +311,7 @@ class MonitoringService:
                             print(f"Time: {ts:%Y-%m-%d %H:%M:%S}")
                             print("----------------------")
             else:
-                # If not attempting face recognition this frame, estimate face_bbox from last detection (if any)
+                # If not attempting face recognition this frame, estimate face_bbox from last detection
                 if utrk.get("relative_face_bbox") is not None and crop_w > 0 and crop_h > 0:
                     rx1, ry1, rx2, ry2 = utrk["relative_face_bbox"]
                     utrk["face_bbox"] = [
@@ -341,7 +329,7 @@ class MonitoringService:
             if not utrk.get("recognized", False)
         }
 
-        # 6. Clean up lost sessions that exceed the lost timeout
+        # 7. Clean up lost sessions that exceed the lost timeout
         exited_list = self.global_session_manager.process_timeouts(ts)
         for session in exited_list:
             duration_sec = session.working_duration
@@ -357,7 +345,7 @@ class MonitoringService:
             print("----------------------")
             logger.info("Employee Left - %s | Duration: %s", session.employee_name, duration_str)
 
-        # 7. Visual Render
+        # 8. Visual Render
         fps = self.camera_manager.get_fps(cam_id)
         
         # Build Camera Session Projections
@@ -377,6 +365,8 @@ class MonitoringService:
                 self.productivity_score = gs.productivity_score
                 self.recognition_confidence = gs.recognition_confidence
                 self.is_recognized = (gs.status == "tracking") and (gs.employee_id is not None)
+                self.pose_state = state.pose_state
+                self.phone_confirmed_use_active = gs.phone_confirmed_use_active
 
         active_projections = []
         for s in self.global_session_manager.sessions.values():
@@ -389,6 +379,7 @@ class MonitoringService:
             frame=frame,
             sessions=active_projections,
             unrecognized_tracks=unreg_list,
+            detections=all_detections,
             fps=fps,
         )
 
@@ -406,6 +397,8 @@ class MonitoringService:
             print(f"Recognition Confidence: {proj.recognition_confidence:.1f}%", flush=True)
             print(f"Bounding Box: {proj.bbox}", flush=True)
             print(f"Drawing Green Box = {drawing_green_box}", flush=True)
+            if proj.pose_state:
+                print(f"Head Direction = {proj.pose_state.get('head_direction')}", flush=True)
             print("----------------------", flush=True)
             
             self.prev_bboxes[key] = proj.bbox
@@ -461,3 +454,4 @@ if __name__ == "__main__":
     args = _parse_args()
     service = MonitoringService(max_frames=args.max_frames, display=args.display)
     service.run()
+

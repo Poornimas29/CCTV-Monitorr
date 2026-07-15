@@ -7,9 +7,10 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Load .env from project root
+# Load .env from project root — override=True ensures .env always wins even if
+# environment variables were cached from a previous run.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(dotenv_path=PROJECT_ROOT / ".env")
+load_dotenv(dotenv_path=PROJECT_ROOT / ".env", override=True)
 
 # RTSP Stream Settings
 RTSP_URL: str = os.getenv("RTSP_URL", "mock")
@@ -71,6 +72,37 @@ OUTPUT_DIR: str = os.getenv("OUTPUT_DIR", "output")
 
 # Log file path
 LOG_FILE: str = os.path.join(LOG_DIR, "app.log")
+
+# Phase 2 Configs
+try:
+    CONF_PERSON: float = float(os.getenv("CONF_PERSON", "0.50"))
+except ValueError:
+    CONF_PERSON = 0.50
+
+try:
+    CONF_PHONE: float = float(os.getenv("CONF_PHONE", "0.30"))
+except ValueError:
+    CONF_PHONE = 0.30
+
+try:
+    CONF_UNIFORM: float = float(os.getenv("CONF_UNIFORM", "0.40"))
+except ValueError:
+    CONF_UNIFORM = 0.40
+
+try:
+    CONF_SAFETY_CAP: float = float(os.getenv("CONF_SAFETY_CAP", "0.40"))
+except ValueError:
+    CONF_SAFETY_CAP = 0.40
+
+try:
+    PHONE_USAGE_CONFIRM_SECONDS: float = float(os.getenv("PHONE_USAGE_CONFIRM_SECONDS", "2.0"))
+except ValueError:
+    PHONE_USAGE_CONFIRM_SECONDS = 2.0
+
+try:
+    REID_SIMILARITY_THRESHOLD: float = float(os.getenv("REID_SIMILARITY_THRESHOLD", "0.65"))
+except ValueError:
+    REID_SIMILARITY_THRESHOLD = 0.65
 
 def build_default_rtsp_url() -> str:
     """Construct a full RTSP URL from the individual environment variables.
