@@ -104,7 +104,7 @@ class YOLO26Detector:
             return []
 
         # Run inference using ultralytics YOLO model on selected device (CPU/GPU/CUDA) with imgsz=320
-        results = self.model(frame, conf=0.4, verbose=False, imgsz=320, device=self.device)[0]
+        results = self.model(frame, conf=0.25, verbose=False, imgsz=320, device=self.device)[0]
         detections: List[Detection] = []
 
         if results.boxes is not None:
