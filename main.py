@@ -197,6 +197,16 @@ def main() -> None:
     annotated_frames = {}
 
     try:
+        # ── Warm-up YOLO detector so bounding boxes appear from the first frame ──
+        # Without this the async detection worker returns no results for the first
+        # 1-2 seconds because the GPU kernel hasn't been JIT-compiled yet.
+        import numpy as _np
+        _dummy = _np.zeros((360, 640, 3), dtype=_np.uint8)
+        monitoring_service._submit_frame_for_detection(camera_ids[0], _dummy)
+        # Give the worker ~3 s to complete the warm-up inference before starting display.
+        time.sleep(3.0)
+        logger.info("YOLO warm-up complete — starting display loop.")
+
         # Loop interval derived from target FPS
         wait_time_ms = max(1, int(1000 / TARGET_FPS))
 

@@ -31,9 +31,16 @@ class RTSPStream:
         self.reconnect_delay = reconnect_delay
         self.cap: cv2.VideoCapture | None = None
         self._stop = False
-        
+        self._frame_interval: float = 0.0   # seconds between frames for file playback
+        self._last_frame_time: float = 0.0  # monotonic clock of last decoded frame
+
         # Enable mock simulation mode if the URL is "mock"
         self.is_mock = (url.lower() == "mock")
+        # Detect local file playback (not RTSP and not mock)
+        self._is_file = (
+            not self.is_mock
+            and not url.lower().startswith("rtsp://")
+        )
 
     def _open(self) -> None:
         if self.is_mock:
@@ -63,6 +70,16 @@ class RTSPStream:
         # Set video buffer size to 1 to enforce real-time decoding and prevent queue buildup lag
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
+        # For local file playback, read the native FPS and compute per-frame sleep interval.
+        # This prevents the reader thread from decoding frames faster than real-time.
+        if self._is_file:
+            native_fps = self.cap.get(cv2.CAP_PROP_FPS)
+            if native_fps and native_fps > 0:
+                self._frame_interval = 1.0 / native_fps
+            else:
+                self._frame_interval = 1.0 / 25.0   # fallback: 25 fps
+            self._last_frame_time = 0.0
+
 
     def read(self) -> Tuple[bool, "any", datetime]:
         """Read a single frame.
@@ -78,12 +95,27 @@ class RTSPStream:
 
         if self.cap is None or not self.cap.isOpened():
             self._open()
+
+        # Throttle file playback to native video FPS so the dashboard
+        # plays at real-time speed instead of racing through frames.
+        if self._is_file and self._frame_interval > 0:
+            now = time.monotonic()
+            elapsed = now - self._last_frame_time
+            if elapsed < self._frame_interval:
+                time.sleep(self._frame_interval - elapsed)
+            self._last_frame_time = time.monotonic()
+
         ret, frame = self.cap.read()
         if not ret:
-            # Force reconnection on next call.
-            self.cap.release()
-            self.cap = None
-            raise RuntimeError(f"[{self.cam_id}] Frame read failed")
+            # End of file — loop back to the start for continuous playback
+            if self._is_file:
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ret, frame = self.cap.read()
+            if not ret:
+                # Force reconnection on next call.
+                self.cap.release()
+                self.cap = None
+                raise RuntimeError(f"[{self.cam_id}] Frame read failed")
         return True, frame, datetime.utcnow()
 
     def _read_mock(self) -> Tuple[bool, np.ndarray, datetime]:

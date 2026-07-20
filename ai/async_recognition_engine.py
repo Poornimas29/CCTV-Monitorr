@@ -159,9 +159,17 @@ class AsyncRecognitionEngine:
                 scale = max_side / max(h, w)
                 new_w = max(1, int(w * scale))
                 new_h = max(1, int(h * scale))
-                crop = crop.copy()  # ensure it is a plain ndarray copy
                 import cv2 as _cv2
-                crop = _cv2.resize(crop, (new_w, new_h), interpolation=_cv2.INTER_LINEAR)
+                # ascontiguousarray guarantees a C-contiguous uint8 array —
+                # large crops sliced from the frame can have non-contiguous
+                # strides that cause 'maximum dimension 64' errors in NumPy/ONNX.
+                crop = _cv2.resize(
+                    np.ascontiguousarray(crop, dtype=np.uint8),
+                    (new_w, new_h),
+                    interpolation=_cv2.INTER_LINEAR,
+                )
+            else:
+                crop = np.ascontiguousarray(crop, dtype=np.uint8)
 
             face_dets = self._face_rec.detect_faces(crop)
             if not face_dets:

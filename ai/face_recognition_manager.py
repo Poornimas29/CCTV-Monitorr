@@ -30,13 +30,15 @@ class FaceRecognitionManager:
             selected_providers = []
             if "CUDAExecutionProvider" in providers:
                 selected_providers.append("CUDAExecutionProvider")
-            if "DmlExecutionProvider" in providers:
-                selected_providers.append("DmlExecutionProvider")
+            # NOTE: DmlExecutionProvider (DirectML) is intentionally excluded.
+            # Running InsightFace on DirectML concurrently with YOLO on Intel GPU
+            # (OpenVINO) causes TDR — the GPU driver suspends, killing both.
+            # InsightFace runs on CPU; crops are pre-scaled to ≤256px so it is fast.
             selected_providers.append("CPUExecutionProvider")
 
             logger.info("InsightFace initializing with providers: %s", selected_providers)
             app = FaceAnalysis(name="buffalo_l", providers=selected_providers)
-            has_gpu = "CUDAExecutionProvider" in selected_providers or "DmlExecutionProvider" in selected_providers
+            has_gpu = "CUDAExecutionProvider" in selected_providers
             ctx_id = 0 if has_gpu else -1
             app.prepare(ctx_id=ctx_id, det_size=(640, 640))
             self.insightface_app = app
