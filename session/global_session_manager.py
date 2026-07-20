@@ -47,20 +47,36 @@ class GlobalSession:
     phone_confirmed_use_active: bool = False
     phone_use_history: List[Dict[str, Any]] = field(default_factory=list)
 
+    # Accurate working time — accumulated only when status == "tracking".
+    # This excludes all gaps where the person was lost/out-of-frame.
+    accumulated_working_seconds: float = 0.0
+
+    # Count of confirmed phone usage events (each start→end interval = 1 event)
+    phone_use_count: int = 0
+
+    # Cross-camera movement history: list of {cam_id, entry_time, exit_time}
+    camera_history: List[Dict[str, Any]] = field(default_factory=list)
+
     @property
     def working_duration(self) -> float:
-        """Returns the total tracked duration in seconds."""
-        if self.first_seen and self.last_seen:
-            return (self.last_seen - self.first_seen).total_seconds()
-        return 0.0
+        """Returns ACTUAL accumulated on-camera tracking time in seconds.
+        
+        Unlike (last_seen - first_seen), this value excludes all gaps where
+        the session was in "lost" status — lunch breaks, walking behind
+        racks, RTSP glitches, etc.
+        """
+        return self.accumulated_working_seconds
 
 
 class GlobalSessionManager:
-    """Manages active global employee sessions across multiple cameras."""
+    """Manages active global employee sessions across multiple cameras, with cross-camera stitching support."""
+
+    
     
     def __init__(self, lost_timeout_seconds: int = 30) -> None:
         self.sessions: Dict[str, GlobalSession] = {}  # session_id -> GlobalSession
         self.lost_timeout = timedelta(seconds=lost_timeout_seconds)
+
 
     def get_session_by_track(self, camera_id: str, track_id: int) -> Optional[GlobalSession]:
         """Find an active session associated with a specific camera and track ID."""
@@ -80,15 +96,20 @@ class GlobalSessionManager:
         timestamp: datetime,
         confidence: float,
         reid_features: Optional[np.ndarray] = None,
-        reid_hist: Optional[np.ndarray] = None
+        reid_hist: Optional[np.ndarray] = None,
     ) -> GlobalSession:
-        """Create a new global session or reactivate/re-bind an existing non-exited session."""
+        """Create a new global session or reactivate an existing one.
+
+        After creation, we attempt to stitch this session with any other active
+        sessions that belong to the same employee on a different camera.
+        """
         if reid_features is None and reid_hist is not None:
             reid_features = reid_hist
 
         # Check for an existing non-exited session for this employee to prevent duplicates
         for session in self.sessions.values():
             if session.employee_id == employee_id and session.status != "exited":
+                # Reactivate existing session
                 session.status = "tracking"
                 self.bind_camera_track(session, camera_id, track_id, bbox, timestamp, reid_features)
                 return session
@@ -110,9 +131,11 @@ class GlobalSessionManager:
             phone_use_duration=0.0,
             productivity_score=100.0,
             recognition_confidence=confidence,
-            logged_left=False
+            logged_left=False,
         )
         self.sessions[session_id] = session
+        # Attempt cross‑camera stitching with any other session of the same employee
+        self._stitch_cross_camera(session)
         return session
 
     def update_track(
@@ -123,9 +146,13 @@ class GlobalSessionManager:
         bbox: List[int],
         timestamp: datetime,
         phone_dets: List[Any],
-        pose_state: Optional[Dict[str, Any]] = None
+        pose_state: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """Update an existing session's tracking state on a camera, and update metrics."""
+        """Update an existing session's tracking state on a camera.
+
+        After the normal update we also invoke cross‑camera stitching to merge
+        any other sessions that share the same employee ID.
+        """
         session.last_seen = timestamp
         session.status = "tracking"
         session.current_track_id = track_id
@@ -141,6 +168,12 @@ class GlobalSessionManager:
         cam_state.bbox = list(bbox)
         cam_state.last_seen = timestamp
         cam_state.pose_state = pose_state
+
+        # ── Accumulate REAL working time (excludes gaps) ─────────────────────
+        if prev_seen is not None and session.status == "tracking":
+            dt = (timestamp - prev_seen).total_seconds()
+            if 0.0 < dt < 10.0:
+                session.accumulated_working_seconds += dt
 
         # ── Phone-Hand Proximity Check ──────────────────────────────────
         phone_used = False
@@ -218,6 +251,48 @@ class GlobalSessionManager:
             session.productivity_score = max(0.0, min(100.0, 100.0 * (non_phone_time / total_duration)))
         else:
             session.productivity_score = 100.0
+            
+        # After all updates, attempt to stitch with other sessions of the same employee.
+        self._stitch_cross_camera(session)
+
+    def _stitch_cross_camera(self, primary: GlobalSession) -> None:
+        """Merge *primary* with any other session that belongs to the same
+        employee but appears on a different camera.
+
+        The merge consolidates ``visible_cameras`` and ``camera_history`` and
+        updates ``first_seen``/``last_seen`` to reflect the combined timeframe.
+        After merging the secondary session is removed from ``self.sessions``.
+        """
+        for sid, other in list(self.sessions.items()):
+            if other is primary:
+                continue
+            if other.employee_id == primary.employee_id and other.status != "exited":
+                # Merge visible cameras (do not overwrite existing entries)
+                for cam_id, cam_state in other.visible_cameras.items():
+                    if cam_id not in primary.visible_cameras:
+                        primary.visible_cameras[cam_id] = cam_state
+                # Merge camera history
+                primary.camera_history.extend(other.camera_history)
+                # Update timestamps
+                if other.first_seen < primary.first_seen:
+                    primary.first_seen = other.first_seen
+                if other.last_seen > primary.last_seen:
+                    primary.last_seen = other.last_seen
+                # Accumulate working seconds, phone usage, etc.
+                primary.accumulated_working_seconds += other.accumulated_working_seconds
+                primary.phone_use_duration += other.phone_use_duration
+                primary.phone_use_history.extend(other.phone_use_history)
+                primary.phone_use_count += other.phone_use_count
+                # Remove the duplicated session
+                del self.sessions[sid]
+                logger.info(
+                    "[GlobalSessionManager] Merged session %s into %s for employee %s",
+                    sid,
+                    primary.session_id,
+                    primary.employee_id,
+                )
+                # Only one merge expected per call
+                break
 
     def bind_camera_track(
         self,
@@ -227,9 +302,14 @@ class GlobalSessionManager:
         bbox: List[int],
         timestamp: datetime,
         reid_features: Optional[np.ndarray] = None,
-        reid_hist: Optional[np.ndarray] = None
+        reid_hist: Optional[np.ndarray] = None,
     ) -> None:
-        """Bind/reconnect a camera track ID to a global session."""
+        """Bind/reconnect a camera track ID to a global session.
+
+        This method also starts a new entry in ``camera_history`` for the given
+        camera.  No stitching is performed here because the session already
+        belongs to the correct employee.
+        """
         if reid_features is None and reid_hist is not None:
             reid_features = reid_hist
 
@@ -241,21 +321,33 @@ class GlobalSessionManager:
             if reid_features.ndim > 1:
                 session.reid_hist = reid_features
 
-
         session.visible_cameras[camera_id] = CameraTrackState(
             track_id=track_id,
             bbox=list(bbox),
             last_seen=timestamp
         )
 
+        # Open a new camera_history entry for this camera appearance
+        session.camera_history.append({
+            "cam_id": camera_id,
+            "entry_time": timestamp,
+            "exit_time": None,
+        })
+
     def handle_lost_track(self, camera_id: str, track_id: int, timestamp: datetime) -> None:
         """Mark a track as lost on a specific camera.
 
-        If the session is no longer visible on any camera, its global status is set to 'lost'.
+        The method closes the ``camera_history`` entry for the camera and, if the
+        employee is no longer visible on any camera, marks the session as ``lost``.
         """
         for session in self.sessions.values():
             if session.status != "exited" and camera_id in session.visible_cameras:
                 if session.visible_cameras[camera_id].track_id == track_id:
+                    # Close the open camera_history entry for this camera
+                    for entry in reversed(session.camera_history):
+                        if entry["cam_id"] == camera_id and entry["exit_time"] is None:
+                            entry["exit_time"] = timestamp
+                            break
                     # Remove from active visible cameras
                     del session.visible_cameras[camera_id]
                     # If not visible on any camera, set global status to lost
@@ -270,6 +362,15 @@ class GlobalSessionManager:
         for session in list(self.sessions.values()):
             if session.status == "lost":
                 if timestamp - session.last_seen > self.lost_timeout:
+                    # Finalise phone usage if active … (unchanged) …
+                    session.status = "exited"
+                    exited.append(session)
+        return exited
+        """Find and return sessions that have been lost for longer than the timeout."""
+        exited = []
+        for session in list(self.sessions.values()):
+            if session.status == "lost":
+                if timestamp - session.last_seen > self.lost_timeout:
                     # If phone usage was active during timeout, finalize it
                     if session.phone_use_start is not None:
                         duration = (session.last_seen - session.phone_use_start).total_seconds()
@@ -279,6 +380,7 @@ class GlobalSessionManager:
                                 "end": session.last_seen,
                                 "duration": duration
                             })
+                            session.phone_use_count += 1
                         session.phone_use_start = None
                         session.phone_confirmed_use_active = False
                     

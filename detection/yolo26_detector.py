@@ -53,11 +53,23 @@ class YOLO26Detector:
 
         self.model_path = Path(model_path) if model_path else None
         
-        # Detect best available device for YOLO (defaulting to CPU to prevent startup latency blocking RTSP camera threads)
-        if torch.cuda.is_available():
-            self.device = "cuda"
+        import os
+        # Detect best available device for YOLO (auto-selects CUDA, Intel GPU via OpenVINO, or CPU)
+        env_device = os.getenv("YOLO_DEVICE", "auto").lower()
+        if env_device != "auto":
+            self.device = env_device
         else:
-            self.device = "cpu"
+            if torch.cuda.is_available():
+                self.device = "cuda"
+            else:
+                try:
+                    core = ov.Core()
+                    if "GPU" in core.available_devices:
+                        self.device = "intel:gpu"
+                    else:
+                        self.device = "cpu"
+                except Exception:
+                    self.device = "cpu"
 
         # Load custom model if provided, otherwise default to yolo26n.pt
         model_name = str(self.model_path) if self.model_path else "yolo26n.pt"
@@ -103,9 +115,16 @@ class YOLO26Detector:
         if frame is None or frame.size == 0:
             return []
 
-        # Run inference using ultralytics YOLO model on selected device (CPU/GPU/CUDA) with imgsz=320
-        # Use low conf to allow thresholding in settings
-        results = self.model(frame, conf=0.15, verbose=False, imgsz=320, device=self.device)[0]
+        # Run inference using ultralytics YOLO model on selected device (CPU/GPU/CUDA).
+        # IMPORTANT: The OpenVINO-compiled model is shape-locked at export time (320x320).
+        # Passing a different imgsz to an OpenVINO model raises a shape-mismatch error.
+        # For the PyTorch/CPU path we can use a larger imgsz for better overhead detection.
+        # conf=0.10 keeps candidate detections broad; per-class thresholding happens below.
+        if self.device == "intel:gpu":
+            infer_imgsz = 320   # fixed by OpenVINO export shape
+        else:
+            infer_imgsz = 480   # better for overhead/partial person detection
+        results = self.model(frame, conf=0.10, verbose=False, imgsz=infer_imgsz, device=self.device)[0]
         detections: List[Detection] = []
 
         if results.boxes is not None:
@@ -115,7 +134,23 @@ class YOLO26Detector:
 
                 # Filter detections based on configurable thresholds
                 if cls_idx == 0:
-                    if conf < settings.CONF_PERSON:
+                    # Use a lower floor (0.30) so that partially-visible, overhead, or
+                    # bending persons (common in top-down CCTV) are not silently dropped.
+                    # The operator can raise CONF_PERSON in .env for stricter filtering.
+                    person_conf_threshold = min(settings.CONF_PERSON, 0.35)
+                    if conf < person_conf_threshold:
+                        continue
+                    x1_val, y1_val, x2_val, y2_val = map(int, box.xyxy[0].tolist())
+                    w_val = x2_val - x1_val
+                    h_val = y2_val - y1_val
+                    # Aspect-ratio guard: reject obvious non-human blobs.
+                    # IMPORTANT: In top-down / overhead CCTV the camera is above the person,
+                    # so bounding boxes are often nearly square or wider than tall (sitting,
+                    # bending over a desk, only upper-body visible, etc.).
+                    # We therefore allow a generous ratio up to 2.0 (width can be twice the
+                    # height) to catch ALL plausible human poses.  Truly wide non-human
+                    # objects (chairs, bins, shelves) typically exceed 2.0.
+                    if h_val <= 0 or w_val <= 0 or (w_val / h_val) > 2.0:
                         continue
                     label = "person"
                 elif cls_idx == 67:
@@ -171,7 +206,8 @@ class YOLO26Detector:
                 matching_pixels = cv2.countNonZero(combined_cap_mask)
                 match_ratio = matching_pixels / total_head_pixels if total_head_pixels > 0 else 0.0
 
-                if match_ratio > 0.08:  # If more than 8% matches
+                # Must match more than 8%, but less than 80%. A ratio > 80% represents a solid colored box/dustbin, not a human cap crop.
+                if 0.08 < match_ratio < 0.80:
                     cap_conf = min(1.0, 0.5 + match_ratio * 3.0)
                     if cap_conf >= settings.CONF_SAFETY_CAP:
                         cx1 = px1
@@ -204,7 +240,8 @@ class YOLO26Detector:
                 matching_pixels = cv2.countNonZero(combined_uniform_mask)
                 match_ratio = matching_pixels / total_torso_pixels if total_torso_pixels > 0 else 0.0
 
-                if match_ratio > 0.15:  # If more than 15% matches
+                # Must match more than 15%, but less than 80%. A ratio > 80% represents a solid colored box/dustbin, not a human torso crop.
+                if 0.15 < match_ratio < 0.80:
                     uniform_conf = min(1.0, 0.5 + match_ratio * 2.0)
                     if uniform_conf >= settings.CONF_UNIFORM:
                         ux1 = px1

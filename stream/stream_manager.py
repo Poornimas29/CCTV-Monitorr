@@ -47,6 +47,7 @@ class StreamManager:
         self._connected = False
         self._last_fps: float = 0.0
         self._last_resolution: Tuple[int, int] = (0, 0)
+        self._fail_count: int = 0  # consecutive failure count for exponential backoff
         
         class DummyReader:
             def __init__(self, parent):
@@ -94,6 +95,7 @@ class StreamManager:
                 success, frame, _ = self._stream.read()
                 if success:
                     self._connected = True
+                    self._fail_count = 0    # reset backoff on successful read
                     # Store latest frame with timestamp.
                     self.frame_buffer.add(frame, datetime.utcnow())
                     h, w = frame.shape[:2]
@@ -110,9 +112,13 @@ class StreamManager:
                 else:
                     self._connected = False
             except Exception as exc:
-                logger.error("[%s] Stream read error: %s", self.camera_name, exc)
+                self._fail_count += 1
+                # Exponential backoff: 5s, 10s, 20s, capped at 30s
+                backoff = min(self.reconnect_interval * (2 ** min(self._fail_count - 1, 2)), 30)
+                logger.error("[%s] Stream read error (attempt %d, retry in %ds): %s",
+                             self.camera_name, self._fail_count, int(backoff), exc)
                 self._connected = False
-                time.sleep(self.reconnect_interval)
+                time.sleep(backoff)
         # Clean exit.
         self._connected = False
 

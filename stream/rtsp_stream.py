@@ -38,10 +38,31 @@ class RTSPStream:
     def _open(self) -> None:
         if self.is_mock:
             return
-        
-        self.cap = cv2.VideoCapture(self.url)
+
+        # Open RTSP using FFMPEG backend.
+        # Set stimeout (socket timeout) to 5 seconds so a dead RTSP host fails
+        # quickly instead of blocking the reader thread for 20–30 seconds.
+        # The option is embedded in the RTSP URL as an FFMPEG AVOption.
+        timeout_url = self.url
+        # Only modify URL if it is an RTSP stream.
+        if timeout_url.lower().startswith('rtsp://'):
+            if "?" in timeout_url:
+                timeout_url = self.url + "&timeout=5000000"  # 5s in microseconds
+            else:
+                timeout_url = self.url + "?timeout=5000000"
+        # For local file paths (e.g., playback video), use the original URL.
+        self.cap = cv2.VideoCapture(timeout_url, cv2.CAP_FFMPEG)
         if not self.cap.isOpened():
+            # Fallback: try without the custom timeout URL
+            self.cap = cv2.VideoCapture(self.url)
+        if not self.cap.isOpened():
+            if self.cap is not None:
+                self.cap.release()
+                self.cap = None
             raise RuntimeError(f"[{self.cam_id}] Unable to open RTSP stream: {self.url}")
+        # Set video buffer size to 1 to enforce real-time decoding and prevent queue buildup lag
+        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
 
     def read(self) -> Tuple[bool, "any", datetime]:
         """Read a single frame.

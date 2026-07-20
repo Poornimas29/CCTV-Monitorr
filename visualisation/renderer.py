@@ -113,27 +113,32 @@ class Renderer:
                         0.35, (0, 0, 255), 1, cv2.LINE_AA
                     )
 
-        # 3. Draw unrecognized tracks (ONLY face boxes, no body box)
+        # 3. Draw unrecognized tracks (body box and face box)
         for utrk in unrecognized_tracks:
+            # Draw body box in sky-blue
+            bx1, by1, bx2, by2 = utrk["bbox"]
+            cv2.rectangle(overlay, (bx1, by1), (bx2, by2), (255, 120, 0), 2)
+            
+            # Draw "Unknown" label below the bounding box
+            label = f"Unknown (Track: {utrk['track_id']})"
+            size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)[0]
+            cv2.rectangle(overlay, (bx1, by2), (bx1 + size[0] + 10, by2 + 20), (20, 20, 20), -1)
+            cv2.putText(
+                overlay,
+                label,
+                (bx1 + 5, by2 + 15),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (220, 220, 255),
+                1,
+                cv2.LINE_AA,
+            )
+
+            # Draw face box if face is detected
             face_bbox = utrk.get("face_bbox")
             if face_bbox is not None:
                 fx1, fy1, fx2, fy2 = face_bbox
                 cv2.rectangle(overlay, (fx1, fy1), (fx2, fy2), (0, 140, 255), 2)
-                
-                # Draw "Unknown" label
-                label = "Unknown"
-                size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)[0]
-                cv2.rectangle(overlay, (fx1, max(0, fy1 - 18)), (fx1 + size[0] + 10, fy1), (20, 20, 20), -1)
-                cv2.putText(
-                    overlay,
-                    label,
-                    (fx1 + 5, max(12, fy1 - 5)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.45,
-                    (255, 255, 255),
-                    1,
-                    cv2.LINE_AA,
-                )
 
         # 4. Draw active recognized employee sessions (ONLY body box, no face box)
         for s in sessions:

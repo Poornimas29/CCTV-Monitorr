@@ -77,27 +77,16 @@ class CameraManager:
             }
 
         # Keep camera_cfg synced for any legacy direct access
+        from config import settings
         self.camera_cfg = {
-            cam_id: cam.get("url") or self.generate_rtsp_url(cam.get("channel", 1))
+            cam_id: cam.get("url") or self.generate_rtsp_url(cam_id)
             for cam_id, cam in self.camera_configs.items()
         }
 
-    def generate_rtsp_url(self, channel: int) -> str:
-        """Generate RTSP URL for a given channel."""
-        import urllib.parse
+    def generate_rtsp_url(self, cam_id: str) -> str:
+        """Generate default RTSP URL via settings."""
         from config import settings
-        
-        # If RTSP_HOST is empty, or "mock", or RTSP_URL is "mock", return "mock"
-        rtsp_host = getattr(settings, "RTSP_HOST", "")
-        rtsp_url = getattr(settings, "RTSP_URL", "mock")
-        if not rtsp_host or rtsp_host.lower() == "mock" or rtsp_url.lower() == "mock":
-            return "mock"
-            
-        username = getattr(settings, "RTSP_USERNAME", "")
-        password = getattr(settings, "RTSP_PASSWORD", "")
-        port = getattr(settings, "RTSP_PORT", 0)
-        encoded_pwd = urllib.parse.quote(password)
-        return f"rtsp://{username}:{encoded_pwd}@{rtsp_host}:{port}/cam/realmonitor?channel={channel}&subtype=0"
+        return settings.build_default_rtsp_url(cam_id)
 
     def start_all(self) -> None:
         """Start all RTSP streams and the consumer thread.
@@ -107,17 +96,14 @@ class CameraManager:
         from .stream_manager import StreamManager
         
         # Re-sync camera_cfg and camera_configs in case they were modified from outside (e.g. in main.py)
-        self.camera_cfg = {
-            cam_id: cam.get("url") or self.generate_rtsp_url(cam.get("channel", 1))
-            for cam_id, cam in self.camera_configs.items()
-        }
+
 
         from config import settings
         rtsp_password = getattr(settings, "RTSP_PASSWORD", "")
         self._stop_event.clear()
 
         for cam_id, cam in self.camera_configs.items():
-            url = cam.get("url") or self.generate_rtsp_url(cam.get("channel", 1))
+            url = cam.get("url") or self.generate_rtsp_url(cam_id)
             masked_url = url.replace(rtsp_password, "******") if rtsp_password and url != "mock" else url
             logger.info("[CameraManager] Starting stream for %s (Channel %s) with URL: %s", 
                         cam_id, cam.get("channel", "N/A"), masked_url)
