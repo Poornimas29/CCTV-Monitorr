@@ -1,0 +1,15 @@
+{
+  "track_id": 66,
+  "employee_id": null,
+  "employee_name": "Unknown",
+  "camera_id": "CAM002",
+  "entry_time": "2026-07-20T14:05:43.340569",
+  "exit_time": "2026-07-20T14:05:47.478066",
+  "working_hours": 0.001149,
+  "working_duration_seconds": 4.14,
+  "phone_use_duration_seconds": 0.0,
+  "phone_use_count": 0,
+  "track_status": "exited",
+  "auto_clear_after_minutes": 15.0,
+  "note": "Record auto-purged from system after 15 min of inactivity"
+}
