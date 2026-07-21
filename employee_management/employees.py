@@ -35,4 +35,11 @@ EMPLOYEES: list[dict] = [
         "status": "Active",
         "image_folder": "employee_images/EMP003",
     },
+    {
+        "employee_id": "EMP004",
+        "name": "Ravi",
+        "status": "Active",
+        "image_folder": "employee_images/EMP004",
+    },
 ]
+

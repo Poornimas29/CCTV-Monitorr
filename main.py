@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 import datetime
 import logging
 import time
-from typing import Optional
+from typing import Optional, List
 import cv2
 import numpy as np
 
@@ -197,6 +197,16 @@ def main() -> None:
     annotated_frames = {}
 
     try:
+        # ── Warm-up YOLO detector so bounding boxes appear from the first frame ──
+        # Without this the async detection worker returns no results for the first
+        # 1-2 seconds because the GPU kernel hasn't been JIT-compiled yet.
+        import numpy as _np
+        _dummy = _np.zeros((360, 640, 3), dtype=_np.uint8)
+        monitoring_service._submit_frame_for_detection(camera_ids[0], _dummy)
+        # Give the worker ~3 s to complete the warm-up inference before starting display.
+        time.sleep(3.0)
+        logger.info("YOLO warm-up complete — starting display loop.")
+
         # Loop interval derived from target FPS
         wait_time_ms = max(1, int(1000 / TARGET_FPS))
 
@@ -209,19 +219,27 @@ def main() -> None:
                 latest_data = manager.get_latest_frame_with_timestamp(cam_id)
                 if latest_data is not None:
                     frame, ts = latest_data
-                    if connected_map.get(cam_id, False):
-                        last_ts = last_processed_timestamps.get(cam_id)
-                        if ts != last_ts:
+                    # Always process the retrieved frame through the tracking & recognition service
+                    # even if the connection state temporarily fluctuates due to single read errors.
+                    last_ts = last_processed_timestamps.get(cam_id)
+                    if ts != last_ts:
+                        try:
                             annotated, person_states = monitoring_service.process_camera_frame(
                                 cam_id, frame, ts
                             )
                             annotated_frames[cam_id] = annotated
                             last_processed_timestamps[cam_id] = ts
                             frames[cam_id] = annotated
-                        else:
+                        except Exception as frame_exc:
+                            # Log the error but DO NOT crash the loop.
+                            # One bad frame should never kill the entire monitoring session.
+                            logger.error(
+                                "[main] process_camera_frame failed for %s: %s",
+                                cam_id, frame_exc, exc_info=True
+                            )
                             frames[cam_id] = annotated_frames.get(cam_id, frame)
                     else:
-                        frames[cam_id] = frame
+                        frames[cam_id] = annotated_frames.get(cam_id, frame)
                 else:
                     frames[cam_id] = None
 

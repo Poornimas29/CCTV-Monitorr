@@ -21,6 +21,7 @@ if not host or not username:
     sys.exit(1)
 
 # URL encode password to handle special characters (e.g. '@')
+# URL encode password to handle special characters (e.g. '@')
 encoded_pwd = urllib.parse.quote(password)
 rtsp_url = f"rtsp://{username}:{encoded_pwd}@{host}:{port}/cam/realmonitor?channel=3&subtype=0"
 

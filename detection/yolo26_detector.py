@@ -7,9 +7,12 @@ official Ultralytics API. It runs inference for person and cell phone classes.
 
 import logging
 import numpy as np
+import cv2
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List
+
+import config.settings as settings
 
 logger = logging.getLogger(__name__)
 
@@ -50,14 +53,23 @@ class YOLO26Detector:
 
         self.model_path = Path(model_path) if model_path else None
         
-        # Detect best available device for YOLO
-        core = ov.Core()
-        if torch.cuda.is_available():
-            self.device = "cuda"
-        elif "GPU" in core.available_devices:
-            self.device = "intel:gpu"
+        import os
+        # Detect best available device for YOLO (auto-selects CUDA, Intel GPU via OpenVINO, or CPU)
+        env_device = os.getenv("YOLO_DEVICE", "auto").lower()
+        if env_device != "auto":
+            self.device = env_device
         else:
-            self.device = "cpu"
+            if torch.cuda.is_available():
+                self.device = "cuda"
+            else:
+                try:
+                    core = ov.Core()
+                    if "GPU" in core.available_devices:
+                        self.device = "intel:gpu"
+                    else:
+                        self.device = "cpu"
+                except Exception:
+                    self.device = "cpu"
 
         # Load custom model if provided, otherwise default to yolo26n.pt
         model_name = str(self.model_path) if self.model_path else "yolo26n.pt"
@@ -87,7 +99,7 @@ class YOLO26Detector:
             "Framework: OpenVINO (Ultralytics API)" if self.device == "intel:gpu" else "Framework: PyTorch (Ultralytics API)",
             f"Ultralytics Version: {ultralytics.__version__}\n"
             f"Device: {self.device}\n"
-            "Detection Classes: [0, 67]\n"
+            "Detection Classes: [0, 67, 80, 81]\n"
             "Tracking: Class 0 (Person) Only passed to ByteTrack\n"
             "--------------------------------"
         )
@@ -103,22 +115,52 @@ class YOLO26Detector:
         if frame is None or frame.size == 0:
             return []
 
-        # Run inference using ultralytics YOLO model on selected device (CPU/GPU/CUDA) with imgsz=320
-        results = self.model(frame, conf=0.25, verbose=False, imgsz=320, device=self.device)[0]
+        # Run inference using ultralytics YOLO model on selected device (CPU/GPU/CUDA).
+        # IMPORTANT: The OpenVINO-compiled model is shape-locked at export time (320x320).
+        # Passing a different imgsz to an OpenVINO model raises a shape-mismatch error.
+        # For the PyTorch/CPU path we can use a larger imgsz for better overhead detection.
+        # conf=0.10 keeps candidate detections broad; per-class thresholding happens below.
+        if self.device == "intel:gpu":
+            infer_imgsz = 320   # fixed by OpenVINO export shape
+        else:
+            infer_imgsz = 480   # better for overhead/partial person detection
+        results = self.model(frame, conf=0.10, verbose=False, imgsz=infer_imgsz, device=self.device)[0]
         detections: List[Detection] = []
 
         if results.boxes is not None:
             for box in results.boxes:
                 cls_idx = int(box.cls[0].item())
+                conf = float(box.conf[0].item())
+
+                # Filter detections based on configurable thresholds
                 if cls_idx == 0:
+                    # Use a lower floor (0.30) so that partially-visible, overhead, or
+                    # bending persons (common in top-down CCTV) are not silently dropped.
+                    # The operator can raise CONF_PERSON in .env for stricter filtering.
+                    person_conf_threshold = min(settings.CONF_PERSON, 0.35)
+                    if conf < person_conf_threshold:
+                        continue
+                    x1_val, y1_val, x2_val, y2_val = map(int, box.xyxy[0].tolist())
+                    w_val = x2_val - x1_val
+                    h_val = y2_val - y1_val
+                    # Aspect-ratio guard: reject obvious non-human blobs.
+                    # IMPORTANT: In top-down / overhead CCTV the camera is above the person,
+                    # so bounding boxes are often nearly square or wider than tall (sitting,
+                    # bending over a desk, only upper-body visible, etc.).
+                    # We therefore allow a generous ratio up to 2.0 (width can be twice the
+                    # height) to catch ALL plausible human poses.  Truly wide non-human
+                    # objects (chairs, bins, shelves) typically exceed 2.0.
+                    if h_val <= 0 or w_val <= 0 or (w_val / h_val) > 2.0:
+                        continue
                     label = "person"
                 elif cls_idx == 67:
+                    if conf < settings.CONF_PHONE:
+                        continue
                     label = "cell_phone"
                 else:
                     continue
 
                 x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                conf = float(box.conf[0].item())
                 detections.append(
                     Detection(
                         bbox=[x1, y1, x2, y2],
@@ -128,4 +170,93 @@ class YOLO26Detector:
                         track_candidate=(cls_idx == 0)
                     )
                 )
+
+        # ── Color Heuristic Segmenter for Uniform and Safety Cap ──────────
+        # For each person detected, analyze the crop for Uniform / Safety Cap
+        frame_h, frame_w = frame.shape[:2]
+        persons = [d for d in detections if d.class_id == 0]
+        
+        for person in persons:
+            px1, py1, px2, py2 = person.bbox
+            pw = px2 - px1
+            ph = py2 - py1
+            if pw <= 0 or ph <= 0:
+                continue
+
+            crop = frame[max(0, py1):min(frame_h, py2), max(0, px1):min(frame_w, px2)]
+            if crop.size == 0:
+                continue
+
+            # Convert cropped person region to HSV
+            hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+            crop_h, crop_w = crop.shape[:2]
+
+            # 1. Safety Cap Check (Top 20% of person's height)
+            head_h = int(crop_h * 0.2)
+            if head_h > 0:
+                head_crop = hsv[0:head_h, :]
+                total_head_pixels = head_crop.shape[0] * head_crop.shape[1]
+
+                # HSV ranges for Safety Caps: Yellow/Orange, Blue, White
+                yellow_mask = cv2.inRange(head_crop, np.array([10, 80, 80]), np.array([35, 255, 255]))
+                blue_mask = cv2.inRange(head_crop, np.array([90, 50, 50]), np.array([130, 255, 255]))
+                white_mask = cv2.inRange(head_crop, np.array([0, 0, 180]), np.array([180, 40, 255]))
+                combined_cap_mask = yellow_mask | blue_mask | white_mask
+                
+                matching_pixels = cv2.countNonZero(combined_cap_mask)
+                match_ratio = matching_pixels / total_head_pixels if total_head_pixels > 0 else 0.0
+
+                # Must match more than 8%, but less than 80%. A ratio > 80% represents a solid colored box/dustbin, not a human cap crop.
+                if 0.08 < match_ratio < 0.80:
+                    cap_conf = min(1.0, 0.5 + match_ratio * 3.0)
+                    if cap_conf >= settings.CONF_SAFETY_CAP:
+                        cx1 = px1
+                        cy1 = py1
+                        cx2 = px2
+                        cy2 = py1 + head_h
+                        detections.append(
+                            Detection(
+                                bbox=[cx1, cy1, cx2, cy2],
+                                confidence=cap_conf,
+                                class_id=81,
+                                label="safety_cap",
+                                track_candidate=False
+                            )
+                        )
+
+            # 2. Uniform Check (Torso: 20% to 70% of person's height)
+            torso_start_y = int(crop_h * 0.2)
+            torso_end_y = int(crop_h * 0.7)
+            if torso_end_y > torso_start_y:
+                torso_crop = hsv[torso_start_y:torso_end_y, :]
+                total_torso_pixels = torso_crop.shape[0] * torso_crop.shape[1]
+
+                # HSV ranges for Uniforms: Blue, White, Orange/Red
+                blue_mask = cv2.inRange(torso_crop, np.array([90, 50, 50]), np.array([130, 255, 255]))
+                white_mask = cv2.inRange(torso_crop, np.array([0, 0, 150]), np.array([180, 40, 255]))
+                orange_mask = cv2.inRange(torso_crop, np.array([0, 70, 70]), np.array([15, 255, 255]))
+                combined_uniform_mask = blue_mask | white_mask | orange_mask
+
+                matching_pixels = cv2.countNonZero(combined_uniform_mask)
+                match_ratio = matching_pixels / total_torso_pixels if total_torso_pixels > 0 else 0.0
+
+                # Must match more than 15%, but less than 80%. A ratio > 80% represents a solid colored box/dustbin, not a human torso crop.
+                if 0.15 < match_ratio < 0.80:
+                    uniform_conf = min(1.0, 0.5 + match_ratio * 2.0)
+                    if uniform_conf >= settings.CONF_UNIFORM:
+                        ux1 = px1
+                        uy1 = py1 + torso_start_y
+                        ux2 = px2
+                        uy2 = py1 + torso_end_y
+                        detections.append(
+                            Detection(
+                                bbox=[ux1, uy1, ux2, uy2],
+                                confidence=uniform_conf,
+                                class_id=80,
+                                label="uniform",
+                                track_candidate=False
+                            )
+                        )
+
         return detections
+
